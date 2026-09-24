@@ -1116,8 +1116,9 @@ fn main() {
     //
     // Unix only. On Windows the rules are answered by a HostSet membership
     // check in our own code rather than compiled by the engine, so there is no
-    // engine verdict to ask for.
-    #[cfg(unix)]
+    // engine verdict to ask for. (macOS: not ported -- the WebKitGTK FFI the
+    // probe drives does not exist there.)
+    #[cfg(all(unix, not(target_os = "macos")))]
     if std::env::args().any(|arg| arg == "--verify-content-filter") {
         match platform::verify_content_filters() {
             Ok(()) => {
