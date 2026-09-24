@@ -2443,6 +2443,7 @@ version = "1.0.2"
 dependencies = [
  "block2",
  "bsdiff",
+ "dispatch2",
  "ed25519-dalek",
  "fluent-bundle",
  "getrandom 0.2.17",

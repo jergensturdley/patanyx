@@ -289,6 +289,13 @@ objc2-web-kit = { version = "0.3.2", features = [
   "WKFrameInfo",
 ] }
 block2 = "0.6"
+# Named ONLY to reach DispatchQueue::main from the layout code: tao already
+# pulls this exact version (0.3.x) as its own macOS event-loop dependency, so
+# this adds no new code to the build -- it makes an existing one nameable.
+# The view reorder must run OUTSIDE the run-loop observer tao delivers user
+# events from, and the main queue is the standard way out. See reorder_views
+# in src/platform/macos.rs.
+dispatch2 = "0.3"
 
 [dev-dependencies]
 # Test-only: the delta tests GENERATE patches. Shipping code only APPLIES

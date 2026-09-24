@@ -20,11 +20,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSAppearance, NSApplication, NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSOpenPanel,
-    NSPasteboard, NSSavePanel, NSWindowOrderingMode,
+    NSPasteboard, NSSavePanel, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::{ns_string, NSDate, NSDictionary, NSProcessInfo, NSSet, NSString};
 use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKUserScript};
@@ -1238,6 +1239,13 @@ pub fn show_tab(_view: &TabView, webview: &WebView) {
     // Geometry lands on the next relayout, which state.rs performs on every
     // activation; showing is visibility only.
     let _ = webview.set_visible(true);
+    // Focus travels WITH the show, as on Windows: state.rs activates the
+    // current tab at startup, and on that backend show_tab focuses the shown
+    // webview, which is the only reason keyboard ever reaches a page. Without
+    // the same call here the window's first responder stayed the content
+    // view, clicks still worked (buttons need no responder), and every
+    // keystroke in every webview went nowhere.
+    let _ = webview.focus();
 }
 
 pub fn hide_tab(_view: &TabView, webview: &WebView) {
@@ -1335,25 +1343,69 @@ pub fn layout(
         let lift = matches!(arrangement, ChromeLayout::Overlay);
         if hosts.lifted.get() != lift {
             hosts.lifted.set(lift);
-            let page_v = page.webview();
-            let chrome_v = chrome.webview();
             // Main-thread view reorder; both views share the window's
-            // content view as parent.
-            if lift {
-                page_v.addSubview_positioned_relativeTo(
-                    &chrome_v,
-                    NSWindowOrderingMode::Above,
-                    None,
-                );
-            } else {
-                chrome_v.addSubview_positioned_relativeTo(
-                    &page_v,
-                    NSWindowOrderingMode::Above,
-                    None,
-                );
-            }
+            // content view as parent. Deferred off this context -- see
+            // reorder_views for why that is not a nicety. The two into_super
+            // hops are wry's view class up to WKWebView up to NSView.
+            reorder_views(
+                page.webview().into_super().into_super(),
+                chrome.webview().into_super().into_super(),
+                lift,
+            );
         }
     }
+}
+
+/// objc2 handles are !Send on purpose -- these views are main-thread-only --
+/// but DispatchQueue::exec_async requires a `Send` block. Sound anyway: the
+/// block is only ever enqueued on the MAIN queue, back where the handles are
+/// legal, and a `MainThreadOnly` type cannot be touched from anywhere else to
+/// begin with.
+struct MainQueueSend<T: MainThreadOnly>(Retained<T>);
+impl<T: MainThreadOnly> MainQueueSend<T> {
+    // A method, not a field access: the closure's precise capture would
+    // otherwise grab the raw `Retained` out of `.0` and defeat the Send impl.
+    fn into_inner(self) -> Retained<T> {
+        self.0
+    }
+}
+// SAFETY: see the type comment; the value never leaves the main queue.
+unsafe impl<T: MainThreadOnly> Send for MainQueueSend<T> {}
+
+/// Reorder the chrome and the page inside the window's content view.
+///
+/// DEFERRED through the main dispatch queue, and not as a style choice: tao
+/// delivers user events from an end-of-run-loop OBSERVER callback, and an
+/// `addSubview` issued from inside that observer deadlocks in
+/// `-[NSView _setSuperview:]` -- the reorder waits on a Core Animation
+/// transaction the observer-blocked run loop can never commit (observed live:
+/// the whole app wedged solid the moment a modal flipped ChromeLayout to
+/// Overlay, taking every later click with it). The same mutation serviced
+/// from the run loop's main-queue drain -- a normal run-loop turn -- is the
+/// ordinary, safe shape AppKit expects.
+fn reorder_views(page: Retained<NSView>, chrome: Retained<NSView>, chrome_on_top: bool) {
+    let (page, chrome) = (MainQueueSend(page), MainQueueSend(chrome));
+    DispatchQueue::main().exec_async(move || {
+        let (page, chrome) = (page.into_inner(), chrome.into_inner());
+        // SAFETY: main-thread-only view access, inside the main-queue block.
+        let content = unsafe { page.window() }
+            .and_then(|w| unsafe { w.contentView() });
+        let Some(content) = content else { return };
+        // SIBLINGS, not nesting: re-add both to the content view, frontmost
+        // LAST. addSubview:positioned:relativeTo: with a nil sibling appends
+        // to the end of the list, which is the FRONT of the z-order. Nesting
+        // one WKWebView inside the other (the first cut of this code did
+        // exactly that) puts the chrome inside the page's WebContent tree,
+        // where click routing through WebKit's own view hierarchy eats the
+        // panel clicks the toolbar still receives.
+        if chrome_on_top {
+            content.addSubview_positioned_relativeTo(&page, NSWindowOrderingMode::Above, None);
+            content.addSubview_positioned_relativeTo(&chrome, NSWindowOrderingMode::Above, None);
+        } else {
+            content.addSubview_positioned_relativeTo(&chrome, NSWindowOrderingMode::Above, None);
+            content.addSubview_positioned_relativeTo(&page, NSWindowOrderingMode::Above, None);
+        }
+    });
 }
 
 /// Whether a docked pane can actually be laid out on this backend. False: a
