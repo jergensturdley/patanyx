@@ -613,6 +613,58 @@ pub fn freeze_enforced() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream API surface (state.rs is cfg-free; unix.rs is the semantic
+// reference). WebKit enforces blocking inside the engine via content rule
+// lists, so the navigation/wipe bookkeeping that coordinates a UI-process
+// veto on Windows is structurally absent here -- the no-op/true shapes
+// below match unix.rs for the same reasons.
+
+/// No-op: the local-network boundary has no per-request veto to enforce it
+/// with on WebKit (blocking happens in the engine, see the header comment).
+pub fn note_app_navigation(_view: &TabView, _url: &str) {}
+
+/// No-op, as `note_app_navigation`.
+pub fn forget_app_navigation(_view: &TabView) {}
+
+/// Always: nothing but the session wipe holds a first page here, and
+/// AppState already waits for that.
+pub fn initial_navigation_ready(_view: &TabView) -> bool {
+    true
+}
+
+/// No-op: the WebSocket guard is Windows-only, so nothing here is overdue.
+pub fn note_local_network_guard_overdue(_view: &TabView) {}
+
+/// A tab's first navigation could not be issued (host only:
+/// `super::initial_navigation_failure_line`).
+pub fn report_initial_navigation_failure(url: &str, error: &wry::Error) {
+    diag(&super::initial_navigation_failure_line(url, error));
+}
+
+/// No-op: the tab's pending flag is the whole wipe state here.
+pub fn note_session_wipe_finished(_view: &TabView) {}
+
+/// A pending first page here means the tab waits for the session wipe.
+pub fn holds_session_wipe(_view: &TabView, first_page_pending: bool) -> bool {
+    first_page_pending
+}
+
+/// No standing to hand over: the local-network boundary is not enforced in
+/// the UI process on WebKit (see `note_app_navigation`).
+pub struct NewTabGate;
+
+pub fn new_tab_gate(_view: &TabView) -> NewTabGate {
+    NewTabGate
+}
+
+/// Always true, for the same reason as `note_app_navigation`: refusing a
+/// page's new tab here while the page itself may reach the same address
+/// would be a rule with nothing behind it.
+pub fn new_tab_allowed(_gate: Option<&NewTabGate>, _url: &str) -> bool {
+    true
+}
+
+// ---------------------------------------------------------------------------
 // Session wipe
 //
 // WebKit's default store persists cookies, caches and storage between runs.
@@ -1250,6 +1302,11 @@ pub fn show_tab(_view: &TabView, webview: &WebView) {
 
 pub fn hide_tab(_view: &TabView, webview: &WebView) {
     let _ = webview.set_visible(false);
+}
+
+/// Give a tab's page the keyboard (wry's focus on the WKWebView).
+pub fn focus_content(webview: &WebView) {
+    let _ = webview.focus();
 }
 
 pub fn remove_tab(view: &TabView, webview: &WebView) {
