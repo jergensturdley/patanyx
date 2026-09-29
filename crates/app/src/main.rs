@@ -1486,7 +1486,18 @@ fn main() {
                         .and_then(|()| ipc::smoke_tab_sequence(&mut app))
                         .and_then(|()| ipc::smoke_partner_sequence(&mut app))
                         .and_then(|()| ipc::smoke_sponsorship_sequence(&mut app))
-                        .and_then(|()| ipc::smoke_readout_sequence(&mut app));
+                        .and_then(|()| if cfg!(target_os = "macos") {
+                            // The macOS port declares the hover readout off --
+                            // the platform stubs report and set nothing,
+                            // honestly. Its live check would assert a widget
+                            // that does not exist on this platform, so it is
+                            // skipped with a marker rather than a silent pass.
+                            // Linux CI still greps for `READOUT ok`.
+                            println!("READOUT skipped (macOS port: hover readout is off)");
+                            Ok(())
+                        } else {
+                            ipc::smoke_readout_sequence(&mut app)
+                        });
                     match result {
                         Ok(()) => {
                             app.smoke_second_ping_requested = true;
