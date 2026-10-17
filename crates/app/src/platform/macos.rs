@@ -85,7 +85,17 @@ pub struct Hosts {
 
 /// One per tab. Opaque to the rest of the crate, like unix's.
 pub struct TabView {
+    /// The tab id state.rs assigned, carried for the wake events the
+    /// allowance-ending paths send (`AdsAllowanceEnded` needs it; `TabView`
+    /// is otherwise opaque).
+    id: u64,
     state: Rc<RefCell<TabState>>,
+    /// Whether the YouTube ad script is in the controller, kept in step by
+    /// every rebuild. WKUserScript has no removal-by-id and the whole set is
+    /// rebuilt on change, so the slot exists to ANSWER `youtube_ads_install`
+    /// with evidence, the way unix's script slot does -- not to enable
+    /// removal.
+    youtube_script: RefCell<bool>,
 }
 
 pub fn create_hosts(window: Window) -> Hosts {
@@ -228,6 +238,10 @@ pub fn build_content(
     id: u64,
     // Windows-only feature; accepted so both backends keep one signature.
     _permissions: crate::state::PermissionBook,
+    // Kept-profile tabs do not exist on this backend yet (see
+    // `new_webview_builder_for`); recorded on the tab's state so the panel
+    // and `finish_session_wipe` see Main everywhere.
+    profile: crate::kept_profile::ProfileKind,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
     // Blank build, navigate after every script and filter is registered —
     // applying the URL on the builder starts WebKit loading during the build,
@@ -278,6 +292,9 @@ pub fn build_content(
     // The handler above is either installed or build_content already failed;
     // there is no partial state to report honestly.
     state.borrow_mut().fingerprint_probe_reporting = SettingState::Applied;
+    // Main everywhere on this backend (`new_webview_builder_for`), recorded
+    // so the panel and the profile-scoped releases read one answer.
+    state.borrow_mut().profile = profile;
 
     // Load events: state.rs already put an `on_page_load` handler on this
     // builder (UrlChanged/LoadState to the event loop). wry allows ONE such
@@ -310,7 +327,11 @@ pub fn build_content(
     let webview = builder.build_as_child(&hosts._window)?;
     let _ = webview.set_visible(false);
 
-    let view = TabView { state };
+    let view = TabView {
+        id,
+        state,
+        youtube_script: RefCell::new(false),
+    };
     apply_policy(&webview, &view, policy);
     // GPC's navigator property, document-start, all frames — main world, so
     // it is visible before the page's own scripts.
@@ -407,32 +428,13 @@ fn content_controller(webview: &WebView) -> Option<Retained<objc2_web_kit::WKUse
 }
 
 /// Installs this tab's full user-script set: GPC always, fingerprint noise
-/// when ephemeral, cosmetic hiding when ad blocking is on, scrollbar colour.
-/// Called on every change; `removeAllUserScripts` makes re-registration a
-/// rebuild rather than a diff.
+/// when ephemeral, the YouTube ad script when the policy wants it, cosmetic
+/// hiding when ad blocking is on, scrollbar colour. Called on every change;
+/// `removeAllUserScripts` makes re-registration a rebuild rather than a diff.
+/// The single rebuild path, so the youtube_script slot and the controller
+/// cannot drift apart.
 fn install_content_scripts(webview: &WebView, view: &TabView) {
-    let Some(cc) = content_controller(webview) else { return };
-    let mtm = main_thread_marker();
-    let (ephemeral, block_ads) = {
-        let st = view.state.borrow();
-        (st.policy.ephemeral, st.policy.block_ads)
-    };
-    // SAFETY: main-thread controller mutation.
-    unsafe {
-        cc.removeAllUserScripts();
-        cc.addUserScript(&user_script(mtm, privacy::GPC_SCRIPT, GPC_INJECTION));
-        if let Some(source) = privacy::divergence_script(ephemeral) {
-            cc.addUserScript(&user_script(mtm, &source, GPC_INJECTION));
-        }
-        if block_ads {
-            let css = privacy::cosmetic_css(privacy::bundled_rules());
-            if !css.is_empty() {
-                if let Some(script) = css_user_script(mtm, &css, false) {
-                    cc.addUserScript(&script);
-                }
-            }
-        }
-    }
+    rebuild_user_scripts(webview, view);
 }
 
 pub fn page_scrollbar_support() -> &'static str {
@@ -460,29 +462,12 @@ fn install_content_scripts_with_scrollbar(
     view: &TabView,
     scrollbar: &WKUserScript,
 ) {
+    // The scrollbar sheet joins the same rebuild as everything else, so the
+    // set stays exactly one GPC + divergence + YouTube + cosmetic + scrollbar.
+    rebuild_user_scripts(webview, view);
     let Some(cc) = content_controller(webview) else { return };
-    let mtm = main_thread_marker();
-    let (ephemeral, block_ads) = {
-        let st = view.state.borrow();
-        (st.policy.ephemeral, st.policy.block_ads)
-    };
     // SAFETY: main-thread controller mutation.
-    unsafe {
-        cc.removeAllUserScripts();
-        cc.addUserScript(&user_script(mtm, privacy::GPC_SCRIPT, GPC_INJECTION));
-        if let Some(source) = privacy::divergence_script(ephemeral) {
-            cc.addUserScript(&user_script(mtm, &source, GPC_INJECTION));
-        }
-        if block_ads {
-            let css = privacy::cosmetic_css(privacy::bundled_rules());
-            if !css.is_empty() {
-                if let Some(script) = css_user_script(mtm, &css, false) {
-                    cc.addUserScript(&script);
-                }
-            }
-        }
-        cc.addUserScript(scrollbar);
-    }
+    unsafe { cc.addUserScript(scrollbar) };
 }
 
 // -- compiled content filters (WKContentRuleList) --
@@ -677,7 +662,7 @@ pub fn new_tab_allowed(_gate: Option<&NewTabGate>, _url: &str) -> bool {
 // HSTS is deliberately NOT in the set, matching the unix mask's promise.
 
 pub fn begin_new_session_wipe(proxy: &EventLoopProxy<UserEvent>) -> bool {
-    match super::enter_session_wipe() {
+    match super::enter_session_wipe(crate::kept_profile::ProfileKind::Main) {
         super::SessionWipeEntry::Ready => return false,
         super::SessionWipeEntry::Waiting => return true,
         super::SessionWipeEntry::Start => {}
@@ -706,8 +691,10 @@ pub fn begin_new_session_wipe(proxy: &EventLoopProxy<UserEvent>) -> bool {
             &types,
             &NSDate::distantPast(),
             &block2::RcBlock::new(move || {
-                super::finish_session_wipe();
-                let _ = proxy.send_event(UserEvent::SessionWipeFinished);
+                super::finish_session_wipe(crate::kept_profile::ProfileKind::Main);
+                let _ = proxy.send_event(UserEvent::SessionWipeFinished(
+                    crate::kept_profile::ProfileKind::Main,
+                ));
             }),
         );
     }
@@ -822,23 +809,28 @@ pub fn translate_outbox_clears(_view: &TabView) -> u64 {
 // ---------------------------------------------------------------------------
 // Policy, freeze, filters
 
-pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
-    {
+pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) -> TabPolicy {
+    let policy = {
         let mut st = view.state.borrow_mut();
-        st.policy = policy.clone();
-        st.freeze.set_auto(policy.freeze_after_load);
-    }
+        // TabState is the ONE place an allowance lives; rebasing on it keeps a
+        // browser-wide switch from quietly re-blocking an allowed tab.
+        let effective = st.apply_base_policy(policy);
+        st.freeze.set_auto(effective.freeze_after_load);
+        effective
+    };
     // Record what the ENGINE did, not what was asked: the preference was set
     // at build time (see build_content); read it back and report that.
     let applied = {
         // SAFETY: main-thread read of this webview's own configuration.
-        let pref = unsafe {
-            webview.webview().configuration().preferences()
-        };
-        // SAFETY: main-thread property read. The deprecated getter is the one
-        // that mirrors the deprecated builder attribute actually used.
-        #[allow(deprecated)]
-        let enabled = unsafe { pref.javaScriptEnabled() };
+        let config = unsafe { webview.webview().configuration() };
+        // wry's javascript_disabled arm sets the MODERN preference
+        // (defaultWebpagePreferences.allowsContentJavaScript, macOS 10.15+),
+        // not the deprecated per-preferences javaScriptEnabled this read
+        // used to consult. The engine's answer for "does this view run
+        // script" lives in the same property wry wrote, so read it back
+        // from there; the deprecated getter no longer moves.
+        let page_prefs = unsafe { config.defaultWebpagePreferences() };
+        let enabled = unsafe { page_prefs.allowsContentJavaScript() };
         enabled == policy.javascript
     };
     view.state.borrow_mut().script_setting = if applied {
@@ -847,6 +839,8 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
         SettingState::Failed
     };
     set_ad_blocking(webview, view, policy.block_ads);
+    set_youtube_ads(webview, view, policy.block_youtube_ads);
+    policy
 }
 
 fn set_ad_blocking(webview: &WebView, view: &TabView, enable: bool) {
@@ -864,6 +858,59 @@ fn set_ad_blocking(webview: &WebView, view: &TabView, enable: bool) {
             install_freeze_filter(webview, view);
         }
     }
+}
+
+/// Adds or removes the YouTube ad script on this tab. WKUserScript cannot be
+/// scoped by URL pattern the way WebKitGTK's UserScript can, so the script's
+/// own host check is the scoping (privacy.rs's tests pin the gate). The whole
+/// user-script set is rebuilt, so the switch's effect lands on the NEXT
+/// YouTube page load in this tab, which the panel's note says.
+fn set_youtube_ads(webview: &WebView, view: &TabView, on: bool) {
+    *view.youtube_script.borrow_mut() = on;
+    rebuild_user_scripts(webview, view);
+}
+
+/// Rebuilds the tab's whole user-script set: GPC, divergence, the YouTube ad
+/// script when the policy wants it, the cosmetic sheet while blocking, and
+/// the scrollbar sheet through `set_page_scrollbar`'s own path. One rebuild
+/// function so the youtube_script slot and the controller stay in step.
+fn rebuild_user_scripts(webview: &WebView, view: &TabView) {
+    let Some(cc) = content_controller(webview) else { return };
+    let mtm = main_thread_marker();
+    let (ephemeral, block_ads, block_youtube) = {
+        let st = view.state.borrow();
+        (
+            st.policy.ephemeral,
+            st.policy.block_ads,
+            st.policy.block_youtube_ads,
+        )
+    };
+    // SAFETY: main-thread controller mutation.
+    unsafe {
+        cc.removeAllUserScripts();
+        cc.addUserScript(&user_script(mtm, privacy::GPC_SCRIPT, GPC_INJECTION));
+        if let Some(source) = privacy::divergence_script(ephemeral) {
+            cc.addUserScript(&user_script(mtm, &source, GPC_INJECTION));
+        }
+        if block_youtube {
+            cc.addUserScript(&user_script(
+                mtm,
+                privacy::YOUTUBE_ADS_SCRIPT,
+                GPC_INJECTION,
+            ));
+        }
+        if block_ads {
+            let css = privacy::cosmetic_css(privacy::bundled_rules());
+            if !css.is_empty() {
+                if let Some(script) = css_user_script(mtm, &css, false) {
+                    cc.addUserScript(&script);
+                }
+            }
+        }
+    }
+    // The slot mirrors what was handed to the controller this rebuild, which
+    // is the evidence `youtube_ads_install` reports.
+    *view.youtube_script.borrow_mut() = block_youtube;
 }
 
 /// WebKit's ITP is enabled or absent; it has no Strict/Balanced level. The
@@ -905,6 +952,449 @@ pub fn unfreeze(webview: &WebView, view: &TabView) {
 /// is no per-host exception in the rule-list model (same as WebKitGTK).
 pub fn set_adlist_override(view: &TabView, host: Option<String>) {
     view.state.borrow_mut().set_adlist_override(host);
+}
+
+// ---------------------------------------------------------------------------
+// "Allow ads and trackers on this tab" (1.0.7)
+//
+// WKWebView decides inside the engine via compiled rule lists, the same
+// mechanism unix uses, so the shape here is unix's: the ALLOWANCE is pure
+// `TabState` (grant/end/unless-same-site), and the engine side is a rebuild
+// of this tab's rule lists from what the state now wants. The malicious
+// overlap rides along, process-wide like unix's, so an allowed tab keeps a
+// malicious-host backstop and `ads_allow_ready` can refuse the switch until
+// that backstop exists.
+//
+// `allow_ads_on_tab` rebuilds synchronously BEFORE returning, so the reload
+// `set_tab_ads_allowed` issues next can never go out with the bundled lists
+// still installed -- the contract unix's `sync_ad_filters` gives the
+// response-policy guard, met here by doing the work inline (WKContentRuleList
+// compilation is cached in-process, and both bundled lists are already
+// compiled by the tab's own build).
+
+thread_local! {
+    /// The proxy the overlap filter's settled event goes out through. Set at
+    /// the first tab build, like unix's FREEZE_STATUS_WAKE.
+    static OVERLAP_WAKE: RefCell<Option<EventLoopProxy<UserEvent>>> = const { RefCell::new(None) };
+    /// The malicious-overlap rule list in memory, keyed by the id it compiles
+    /// under. Mirrors unix's `OverlapFilter`.
+    static OVERLAP: RefCell<OverlapFilter> = RefCell::new(OverlapFilter::NotBuilt);
+    /// Guards the async compile: a stale completion (the lists refreshed
+    /// again meanwhile) must never install. Same shape as unix's
+    /// AD_OVERLAP_GENERATION.
+    static OVERLAP_GENERATION: RefCell<crate::adlist_consent::FilterGeneration> =
+        RefCell::new(crate::adlist_consent::FilterGeneration::new());
+}
+
+/// The in-memory malicious-overlap filter, mirroring unix's `OverlapFilter`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OverlapFilter {
+    NotBuilt,
+    /// The rule list WebKit accepted, by id. `None` = computed empty: there
+    /// is genuinely no overlap, and an allowed tab is fully covered.
+    Ready(Option<String>),
+    /// Handed to the store; the completion has not answered yet.
+    Compiling(String),
+    /// The compile failed or was never possible. Fail closed: the switch
+    /// stays unavailable and no allowance may rely on this.
+    Failed,
+}
+
+fn wake_overlap(event: UserEvent) {
+    OVERLAP_WAKE.with(|w| {
+        if let Some(proxy) = w.borrow().as_ref() {
+            let _ = proxy.send_event(event);
+        }
+    });
+}
+
+/// Whether the switch may be offered: the bundled lists the switch has to put
+/// back are always in memory on this backend (compile-first, cached by
+/// identifier), so the only wait is the overlap filter that keeps an allowed
+/// tab covered for hosts on BOTH lists.
+pub fn ads_allow_ready() -> bool {
+    let overlap_ready = OVERLAP.with(|o| matches!(&*o.borrow(), OverlapFilter::Ready(_)));
+    overlap_ready
+}
+
+/// The overlap filter is this backend's: WKWebView has no per-request
+/// malicious-host veto outside the blocklist's navigation handler, so an
+/// allowed tab needs the small compiled filter (unix's reasoning, and the
+/// reason `ad_overlap_wanted` is true on unix and false on Windows).
+pub fn ad_overlap_wanted() -> bool {
+    true
+}
+
+/// The overlap could not be computed (its worker did not start). Fail
+/// closed: nothing compiling may land, and the switch stays unavailable.
+pub fn on_ad_overlap_failed() {
+    OVERLAP_GENERATION.with(|g| g.borrow_mut().invalidate());
+    OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Failed);
+    diag("overlap filter not computed: the worker did not start");
+}
+
+/// The hosts on both lists, from the worker (`blocklist::ad_overlap`).
+/// Compiles them into a WKContentRuleList unless the one in force (or
+/// compiling) already carries exactly these. Returns true when a filter that
+/// allowed tabs may rely on is being replaced, so the caller ends their
+/// allowances rather than leave them running on the old one.
+pub fn on_ad_overlap_computed(hosts: Vec<String>, proxy: &EventLoopProxy<UserEvent>) -> bool {
+    let next = privacy::overlap_filter(&hosts);
+    let next_id = next.as_ref().map(|(_, id)| id.clone());
+    let (unchanged, had_one) = OVERLAP.with(|overlap| match &*overlap.borrow() {
+        OverlapFilter::Ready(ready) => (ready.as_ref() == next_id.as_ref(), true),
+        OverlapFilter::Compiling(id) => (Some(id) == next_id.as_ref(), true),
+        OverlapFilter::NotBuilt | OverlapFilter::Failed => (false, false),
+    });
+    if unchanged {
+        return false;
+    }
+    // Register the proxy first: the very first computation may come back
+    // before any tab build ran (main.rs asks at boot, before the first tab).
+    OVERLAP_WAKE.with(|w| *w.borrow_mut() = Some(proxy.clone()));
+    match next {
+        None => {
+            OVERLAP_GENERATION.with(|g| g.borrow_mut().invalidate());
+            OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Ready(None));
+            wake_overlap(UserEvent::AdOverlapSettled);
+        }
+        Some((json, id)) => {
+            let token = OVERLAP_GENERATION.with(|g| g.borrow_mut().begin());
+            OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Compiling(id.clone()));
+            compile_overlap_filter(&json, &id, token, proxy);
+        }
+    }
+    had_one
+}
+
+/// The overlap compile, WKWebView edition. `compile_and_add` already carries
+/// the whole degrade path (store unavailable, async failure diagnostics);
+/// the generation guard rides in through the captured token so a stale
+/// completion cannot mark the filter Ready.
+fn compile_overlap_filter(json: &str, id: &str, token: u64, proxy: &EventLoopProxy<UserEvent>) {
+    let Some(store) = rule_list_store() else {
+        let current = OVERLAP_GENERATION.with(|g| g.borrow().may_apply(token));
+        if current {
+            OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Failed);
+            diag("overlap filter not compiled: no rule list store");
+            wake_overlap(UserEvent::AdOverlapSettled);
+        }
+        return;
+    };
+    let id_string = privacy::filter_id_for(json);
+    debug_assert_eq!(id_string, *id);
+    let _ = id;
+    let id_ns = NSString::from_str(&id_string);
+    let source = NSString::from_str(json);
+    let proxy = proxy.clone();
+    // SAFETY: the block is retained by the callee for the async lifetime;
+    // WebKit raises the callback on the main thread.
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&id_ns),
+            Some(&source),
+            Some(&block2::RcBlock::new(
+                move |list: *mut WKContentRuleList, error: *mut objc2_foundation::NSError| {
+                    let current = OVERLAP_GENERATION.with(|g| g.borrow().may_apply(token));
+                    if !current {
+                        // Superseded while compiling: OVERLAP already moved on.
+                        return;
+                    }
+                    if !list.is_null() {
+                        OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Ready(Some(id_string.clone())));
+                    } else {
+                        let why = (!error.is_null())
+                            .then(|| Retained::retain(error).expect("error pointer"))
+                            .map(|e| e.localizedDescription().to_string())
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Failed);
+                        diag(&format!("overlap filter not compiled: {why}"));
+                    }
+                    let _ = proxy.send_event(UserEvent::AdOverlapSettled);
+                },
+            )),
+        );
+    }
+}
+
+/// Turns the allowance on for `site`. Refused while the overlap filter the
+/// allowed tab must rely on is not in memory. The engine rebuild happens
+/// HERE, before the return, so the caller's reload cannot race the lists.
+pub fn allow_ads_on_tab(
+    webview: &WebView,
+    view: &TabView,
+    site: String,
+) -> Result<TabPolicy, &'static str> {
+    if !ads_allow_ready() {
+        return Err("ads_not_ready");
+    }
+    let policy = {
+        let mut st = view.state.borrow_mut();
+        let policy = st.grant_ads_allowance(site)?;
+        st.set_adlist_override(None);
+        policy
+    };
+    // The allowance lifts the bundled lists; the malicious-overlap filter
+    // covers the blind spot it opens. Rebuilt inline, synchronously.
+    rebuild_tab_rule_lists(webview, view);
+    set_youtube_ads(webview, view, policy.block_youtube_ads);
+    Ok(policy)
+}
+
+/// Ends the allowance, if there is one, and puts blocking back. Returns
+/// whether there was one. Rebuilds inline for the same reason as
+/// `allow_ads_on_tab`: the reload that follows must see the lists in place.
+pub fn end_ads_allowance(webview: &WebView, view: &TabView) -> bool {
+    let ended = view.state.borrow_mut().end_ads_allowance();
+    if ended {
+        rebuild_tab_rule_lists(webview, view);
+        let on = view.state.borrow().policy.block_youtube_ads;
+        set_youtube_ads(webview, view, on);
+    }
+    ended
+}
+
+/// Ends the allowance if `url` is on another site. Returns whether it ended.
+/// Called from the load handler for every top-level load; WKWebView has no
+/// pre-request veto, so the old document's tail requests ride with the lists
+/// it loaded under -- the same boundary unix's load-signal path draws.
+pub fn end_ads_allowance_if_leaving(webview: &WebView, view: &TabView, url: &str) -> bool {
+    let ended = view
+        .state
+        .borrow_mut()
+        .end_ads_allowance_unless_same_site(url);
+    if ended {
+        rebuild_tab_rule_lists(webview, view);
+        let on = view.state.borrow().policy.block_youtube_ads;
+        set_youtube_ads(webview, view, on);
+        wake_overlap(UserEvent::AdsAllowanceEnded { tab_id: tab_id_of(view) });
+    }
+    ended
+}
+
+/// The browser is about to take this tab to `url` itself. Called BEFORE
+/// `load_url` hands the request to WebKit, so a navigation the browser issues
+/// ends the allowance before the new document's requests can go out. The tab
+/// id travels in the wake because `TabView` is opaque here.
+pub fn end_ads_allowance_before_navigation(webview: &WebView, view: &TabView, url: &str) {
+    if end_ads_allowance_if_leaving(webview, view, url) {
+        wake_overlap(UserEvent::AdsAllowanceEnded { tab_id: tab_id_of(view) });
+    }
+}
+
+pub fn ads_allowed_site(view: &TabView) -> Option<String> {
+    view.state.borrow().ads_allowed_site().map(str::to_string)
+}
+
+/// The policy in force in this tab, the allowance included.
+pub fn tab_policy(view: &TabView) -> TabPolicy {
+    view.state.borrow().policy.clone()
+}
+
+/// What this tab blocks without its allowance (the allowance's base policy).
+pub fn ads_base_blocking(view: &TabView) -> bool {
+    view.state.borrow().ads_base_policy().block_ads
+}
+
+/// Brings this tab's rule lists in line with what its `TabState` wants NOW:
+/// bundled filters while blocking, the malicious-overlap filter while an
+/// allowance is live (and none while there is nothing to cover). The freeze
+/// filter re-rides when the tab is frozen, because WKWebView removes rule
+/// lists as a set. Cosmetic hiding follows the bundled lists.
+fn rebuild_tab_rule_lists(webview: &WebView, view: &TabView) {
+    let Some(cc) = content_controller(webview) else { return };
+    let (wants, wants_overlap, frozen) = {
+        let st = view.state.borrow();
+        (
+            st.wants_ad_filters(),
+            st.wants_overlap_filter(),
+            st.freeze.phase() == FreezePhase::Frozen,
+        )
+    };
+    // Rebuild is the whole set: remove everything, then add exactly what the
+    // state wants. No moment with neither matters here -- WKWebView applies
+    // lists to NEW loads, and the caller always follows with a reload (the
+    // switch's contract), so there is no in-flight page to half-protect.
+    remove_all_filters(&cc);
+    if wants {
+        install_bundled_filters(&cc);
+    } else if wants_overlap {
+        let ready = OVERLAP.with(|o| match &*o.borrow() {
+            OverlapFilter::Ready(Some(id)) => Some(id.clone()),
+            _ => None,
+        });
+        if let Some(id) = ready {
+            add_rule_list(&cc, &id);
+        }
+    }
+    if frozen {
+        install_freeze_filter(webview, view);
+    }
+    install_content_scripts(webview, view);
+}
+
+/// Adds an ALREADY-COMPILED rule list back to this tab's controller. The
+/// store caches by identifier in-process, so the id is enough; compiling
+/// again would be correct but slower.
+fn add_rule_list(cc: &Retained<objc2_web_kit::WKUserContentController>, id: &str) {
+    let Some(store) = rule_list_store() else { return };
+    // The block outlives this frame, so it captures the controller by value.
+    let cc = cc.clone();
+    let id_ns = NSString::from_str(id);
+    // SAFETY: main-thread store read; the block is retained by WebKit for the
+    // async lifetime.
+    unsafe {
+        store.lookUpContentRuleListForIdentifier_completionHandler(
+            Some(&id_ns),
+            Some(&block2::RcBlock::new(
+                move |list: *mut WKContentRuleList, _error: *mut objc2_foundation::NSError| {
+                    if !list.is_null() {
+                        let list = Retained::retain(list).expect("rule list pointer");
+                        cc.addContentRuleList(&list);
+                    }
+                },
+            )),
+        );
+    }
+}
+
+/// The id recorded on this tab's build, for the wake events. `TabView` is
+/// deliberately opaque, so the id lives beside the state it belongs to.
+fn tab_id_of(view: &TabView) -> u64 {
+    view.id
+}
+
+// ---------------------------------------------------------------------------
+// Per-tab engine reads the panels make (1.0.7)
+
+/// Whether another top-level navigation is about to replace this tab's page.
+/// Windows-only in use upstream (`AdsAllowancePageKept` is a Windows event
+/// shape); the honest answer here is unix's: never asked, always false.
+#[allow(dead_code)]
+pub fn replacement_pending(_view: &TabView) -> bool {
+    false
+}
+
+/// The document on screen. As `replacement_pending`: the kept-page repair
+/// that consumes it is a Windows path.
+#[allow(dead_code)]
+pub fn current_document(_view: &TabView) -> Option<u64> {
+    None
+}
+
+/// Whether a reload without the cache failed since last asked. This backend
+/// reloads synchronously through WebKit (`reloadFromOrigin` below) and never
+/// records a later failure, so there is never one to take -- unix's shape.
+pub fn take_bypass_reload_failed(_view: &TabView) -> bool {
+    false
+}
+
+/// Reload without the cache (the engine's Ctrl+F5), for where ad and tracker
+/// blocking has just come back for the tab. `WKWebView.reloadFromOrigin` is
+/// WebKit's uncached reload, and it answers synchronously -- an error here is
+/// returned, not recorded for later, which is what `take_bypass_reload_failed`
+/// reporting false above says.
+pub fn reload_bypassing_cache(webview: &WebView, _view: &TabView) -> Result<(), ()> {
+    use wry::WebViewExtMacOS as _;
+    // SAFETY: main-thread navigation call on this webview's own WKWebView.
+    unsafe { webview.webview().reloadFromOrigin() };
+    Ok(())
+}
+
+/// No kept profile on this backend, so there is no kept boundary to verify:
+/// every tab is MAIN and the boundary is trivially ready.
+pub fn kept_boundary_ready(_view: &TabView) -> bool {
+    true
+}
+
+/// Frozen by the user's click, which a reload does not lift.
+pub fn manually_frozen(view: &TabView) -> bool {
+    view.state.borrow().freeze.is_manually_frozen()
+}
+
+/// What the engine did with this tab's Fingerprint Divergence script,
+/// recorded at build. See the unix counterpart.
+pub fn divergence_install(view: &TabView) -> privacy::ScriptInstall {
+    view.state.borrow().divergence_install
+}
+
+/// What the engine did with this tab's YouTube ad script. The evidence is the
+/// slot `set_youtube_ads` keeps in step with every rebuild: a tab that wants
+/// the script and shows no slot has none.
+pub fn youtube_ads_install(view: &TabView) -> privacy::ScriptInstall {
+    privacy::youtube_script_install(
+        view.state.borrow().policy.block_youtube_ads,
+        *view.youtube_script.borrow(),
+        false,
+    )
+}
+
+/// Whether the ENGINE runs script in this tab right now, read back from
+/// WebKit's own preferences rather than from the policy the tab was given.
+/// `None` when the preferences object cannot be had. The smoke run's
+/// strict-tab check reads THIS, so it proves the engine, not our bookkeeping.
+pub fn engine_script_enabled(webview: &WebView) -> Option<bool> {
+    // Same property wry's javascript_disabled arm writes: the modern
+    // defaultWebpagePreferences.allowsContentJavaScript, not the deprecated
+    // per-preferences getter, which no longer moves on this OS.
+    // SAFETY: main-thread reads of this webview's own configuration.
+    let config = unsafe { webview.webview().configuration() };
+    let page_prefs = unsafe { config.defaultWebpagePreferences() };
+    Some(unsafe { page_prefs.allowsContentJavaScript() })
+}
+
+// ---------------------------------------------------------------------------
+// Kept profile (1.0.7) and window frame (1.0.7): shared-surface stubs.
+// Kept tabs are a Windows feature (kept_profile.rs) and the desktop's title
+// bar stays (window_frame.rs is the Windows half); both answers mirror
+// unix's so every backend exposes one API.
+
+/// No second profile here; every kind builds the ordinary way.
+pub fn new_webview_builder_for(_kind: crate::kept_profile::ProfileKind) -> WebViewBuilder<'static> {
+    new_webview_builder()
+}
+
+/// No kept profile on this backend.
+pub fn kept_profile_supported() -> bool {
+    false
+}
+
+/// The MAIN clear starts with the first content tab on this backend.
+pub fn begin_main_profile_wipe(_webview: &WebView, _proxy: &EventLoopProxy<UserEvent>) {}
+
+/// No kept profile on this backend.
+pub fn begin_kept_profile_start(_hosts: &Hosts, _proxy: &EventLoopProxy<UserEvent>) {}
+
+/// No kept profile on this backend.
+pub fn sweep_kept_permissions(_hosts: &Hosts, _create: bool) {}
+
+/// Nothing to remove on this backend.
+pub fn remove_kept_profile_folder() -> bool {
+    true
+}
+
+/// Linux keeps the desktop's title bar; the chrome draws no window controls
+/// (window_frame.rs is the Windows half). macOS matches: the standard
+/// title bar stays, and `window_control` is never reached.
+pub fn custom_window_frame() -> bool {
+    false
+}
+
+/// Never reached: AppState::window_control refuses first where
+/// `custom_window_frame` is false. Kept so all backends expose one API.
+pub fn window_control(
+    _hosts: &Hosts,
+    _action: crate::window_frame::WindowAction,
+) -> Result<(), &'static str> {
+    Err("unsupported")
+}
+
+/// The fullscreen notice cannot be drawn on this backend (no native view
+/// layer over page pixels; see the page-fullscreen note), so AppState never
+/// grants a page the screen and the notice never has to show. `set_page_fullscreen`
+/// remains store-only; this false is what keeps the pair honest.
+pub fn fullscreen_notice_can_draw(_hosts: &Hosts) -> bool {
+    false
 }
 
 /// Per-site override: `host` keeps working even while the tab is frozen.
@@ -1679,7 +2169,13 @@ pub fn layout_fullscreen(_hosts: &Hosts, _chrome: &WebView, _page: &WebView) {}
 
 /// The fullscreen notice, top centre. Reuses the hover readout's slot the
 /// way unix does, but the readout is not ported on macOS (its host view
-/// would be another native layer between chrome and page), so this is an
-/// honest no-op — the browser-side fullscreen that could show it never
+/// would be another native layer between chrome and page), so the notice
+/// cannot be shown -- reported as false, which AppState takes as "no page
+/// gets the screen". The browser-side fullscreen that would raise it never
 /// engages on this backend either.
-pub fn set_fullscreen_notice(_hosts: &Hosts, _text: Option<&str>) {}
+pub fn set_fullscreen_notice(_hosts: &Hosts, _text: Option<&str>) -> bool {
+    // False is the honest answer, not a failure: the notice's host widget
+    // does not exist here, so nothing was shown and the caller must not
+    // hand a page the screen over it.
+    false
+}
