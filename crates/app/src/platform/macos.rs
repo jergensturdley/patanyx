@@ -2179,3 +2179,152 @@ pub fn set_fullscreen_notice(_hosts: &Hosts, _text: Option<&str>) -> bool {
     // hand a page the screen over it.
     false
 }
+
+#[cfg(test)]
+mod macos_backend_tests {
+    use super::{diag, recent_diagnostics, DIAG_LOG_CAP};
+    use super::{
+        ads_allowed_site, ads_base_blocking, current_document, custom_window_frame,
+        engine_settings, freeze_enforced, interception_state, kept_boundary_ready,
+        kept_profile_supported, manually_frozen, network_blocking_supported, page_bytes_supported,
+        replacement_pending, session_lock_registered, split_supported,
+        take_bypass_reload_failed, translate_channel_supported, youtube_ads_install, TabView,
+        MACOS_INTERCEPTION_NAME,
+    };
+    use crate::platform::privacy::{ScriptInstall, SettingState, TabPolicy, TabState};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A tab with no engine behind it: enough for every store-only path this
+    /// backend keeps in `TabState` and its own slots. The engine-backed
+    /// answers (rule lists, script installs on a live controller) are the
+    /// smoke gate's job on real hardware; these tests pin the answers that
+    /// do not need a webview, including on Linux CI via the source contracts
+    /// in state.rs and platform/mod.rs.
+    fn store_only_tab(policy: &TabPolicy) -> TabView {
+        TabView {
+            id: 7,
+            state: Rc::new(RefCell::new(TabState::new(policy))),
+            youtube_script: RefCell::new(false),
+        }
+    }
+
+    /// Each `false` here is a promise the panel renders: a control this
+    /// backend cannot honour is hidden or explained, never shown and inert.
+    /// If one of these turns true, the port grew the feature and the parity
+    /// list shipped with it is stale and must be rewritten in the same
+    /// change.
+    #[test]
+    fn the_declared_off_switches_stay_off() {
+        assert!(!kept_profile_supported(), "kept profile is not ported");
+        assert!(
+            !custom_window_frame(),
+            "macOS keeps the standard title bar, matching unix"
+        );
+        assert!(!split_supported(), "docked panes are not laid out here");
+        assert!(
+            !page_bytes_supported(),
+            "WebKit serves no main-resource bytes to this process"
+        );
+        assert!(
+            !translate_channel_supported(),
+            "the translator channel is not ported"
+        );
+        assert_eq!(
+            session_lock_registered(),
+            SettingState::NotAttempted,
+            "the vault lock on screen lock is deferred, not half-built"
+        );
+    }
+
+    /// The stubs that answer from `TabState` must refuse rather than invent:
+    /// a pending replacement, a document id or a recorded reload failure on
+    /// this backend would be bookkeeping with no engine event behind it,
+    /// which is exactly the class of lie the honest-stub rule exists for.
+    #[test]
+    fn the_store_only_stub_answers_refuse_rather_than_invent() {
+        let view = store_only_tab(&TabPolicy::default());
+        assert!(!replacement_pending(&view));
+        assert_eq!(current_document(&view), None);
+        assert!(
+            !take_bypass_reload_failed(&view),
+            "reloadFromOrigin answers synchronously; there is no later failure to record"
+        );
+        assert!(kept_boundary_ready(&view), "every tab is MAIN, boundary trivially ready");
+        assert!(!manually_frozen(&view));
+        assert_eq!(ads_allowed_site(&view), None);
+        assert!(
+            ads_base_blocking(&view),
+            "the default policy blocks ads, with or without an allowance path"
+        );
+    }
+
+    /// The mechanism the panel shows must name what actually blocks on this
+    /// platform, never Windows' word for it, and blocking must be real.
+    #[test]
+    fn the_interception_name_says_what_actually_runs() {
+        let view = store_only_tab(&TabPolicy::default());
+        assert_eq!(interception_state(&view), MACOS_INTERCEPTION_NAME);
+        assert_eq!(MACOS_INTERCEPTION_NAME, "content_rule_list");
+        assert!(network_blocking_supported());
+        assert!(freeze_enforced());
+    }
+
+    /// The rows with no macOS answer stay "not_attempted" exactly as on unix:
+    /// a row that claimed "applied" without an engine acknowledgement is the
+    /// finding the 2026-10-08 audit was about.
+    #[test]
+    fn the_engine_settings_rows_without_a_macos_answer_say_not_attempted() {
+        let view = store_only_tab(&TabPolicy::default());
+        let settings = engine_settings(&view);
+        assert_eq!(settings.hardened_environment, "not_attempted");
+        assert_eq!(settings.session_lock_registered, "not_attempted");
+        assert_eq!(settings.content_script_registered, "not_attempted");
+        assert_eq!(settings.permissions_registered, "not_attempted");
+        assert_eq!(
+            settings.sandbox, "not_attempted",
+            "WebContent's sandbox is the OS's and not queryable here"
+        );
+    }
+
+    /// The YouTube script's reported state comes from the slot the rebuild
+    /// keeps in step with the controller, not from the switch: wanted but
+    /// never installed is a refusal, present is installed, unwanted and
+    /// absent is not-wanted. Same rule privacy.rs pins for the other
+    /// backends, read through this backend's evidence.
+    #[test]
+    fn the_youtube_script_evidence_reports_the_controller_not_the_wish() {
+        let mut off = TabPolicy::default();
+        off.block_youtube_ads = false;
+        let view = store_only_tab(&off);
+        assert_eq!(youtube_ads_install(&view), ScriptInstall::NotWanted);
+
+        let view = store_only_tab(&TabPolicy::default());
+        assert_eq!(
+            youtube_ads_install(&view),
+            ScriptInstall::Refused,
+            "switched on, slot empty, nothing in flight: the engine has no script"
+        );
+        *view.youtube_script.borrow_mut() = true;
+        assert_eq!(youtube_ads_install(&view), ScriptInstall::Installed);
+    }
+
+    /// ONE test, not two, because `diag` writes to a process-global ring
+    /// buffer and cargo runs tests in parallel: split in two, the
+    /// bounded-ness check evicted the entry the other test was asserting on
+    /// (unix.rs hit exactly this). A flaky test is worse than no test.
+    #[test]
+    fn the_diagnostic_log_records_failures_and_stays_bounded() {
+        diag("macos test probe");
+        let first = recent_diagnostics();
+        assert!(
+            first.iter().any(|l| l.contains("macos test probe")),
+            "a recorded failure did not reach the export"
+        );
+        assert_eq!(first, recent_diagnostics(), "reading the log drained it");
+        for i in 0..(DIAG_LOG_CAP * 2) {
+            diag(&format!("macos bound probe {i}"));
+        }
+        assert!(recent_diagnostics().len() <= DIAG_LOG_CAP);
+    }
+}

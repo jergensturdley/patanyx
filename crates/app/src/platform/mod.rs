@@ -332,6 +332,42 @@ mod session_wipe_tests {
             );
         }
     }
+
+    #[test]
+    fn macos_mask_matches_the_site_data_promise() {
+        // macos.rs is cfg-excluded on this Linux test host, so inspect the
+        // exact expression passed to removeDataOfTypes. Same class of
+        // compile-time tripwire as the Windows and unix checks above: it
+        // pins the macOS mask's shape where CI can see it, and is not a
+        // substitute for the smoke gate on real hardware.
+        let source = include_str!("macos.rs");
+        let function = between(source, "fn begin_new_session_wipe(", "// Translate");
+        assert!(function.contains("removeDataOfTypes"));
+        assert!(
+            function.contains("distantPast"),
+            "the wipe must reach back over all history"
+        );
+        let mask = between(function, "let types = NSSet::from_slice", "let store = unsafe");
+        for required in [
+            "WKWebsiteDataTypeCookies",
+            "WKWebsiteDataTypeDiskCache",
+            "WKWebsiteDataTypeMemoryCache",
+            "WKWebsiteDataTypeOfflineWebApplicationCache",
+            "WKWebsiteDataTypeLocalStorage",
+            "WKWebsiteDataTypeSessionStorage",
+            "WKWebsiteDataTypeWebSQLDatabases",
+            "WKWebsiteDataTypeIndexedDBDatabases",
+            "WKWebsiteDataTypeServiceWorkerRegistrations",
+        ] {
+            assert!(mask.contains(required), "macOS wipe lost {required}");
+        }
+        for preserved in ["HSTS"] {
+            assert!(
+                !mask.contains(preserved),
+                "macOS wipe unexpectedly weakens engine protection {preserved}"
+            );
+        }
+    }
 }
 
 /// How the chrome and the page share the window.
