@@ -351,6 +351,11 @@ pub struct TabView {
     /// For engine answers that arrive after the call that asked, so the
     /// toolbar and panels hear them (review 2026-10-12, R-002).
     proxy: EventLoopProxy<UserEvent>,
+    /// A tab built to receive a page's held request: what its request filter
+    /// needs, kept until the filter is attached after the hand-over
+    /// (`attach_deferred_interception`). `None` on every other tab, whose
+    /// filter was attached at build.
+    deferred_interception: RefCell<Option<(Rc<RefCell<std::collections::BTreeSet<String>>>, u64)>>,
 }
 
 pub fn create_hosts(window: Window) -> Hosts {
@@ -552,6 +557,18 @@ const BROWSER_ARGS: &str = concat!(
     " --no-pings",
     " --disable-sync",
     " --force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    // GLOBAL PRIVACY CONTROL FROM THE ENGINE ITSELF, on every request it
+    // sends. The request filter stamps Sec-GPC too, but WebView2 never shows
+    // it the first document of a window a page opened (WebView2Feedback
+    // #5293): a form a site sends into a new tab (a booking or payment
+    // hand-over) and the redirect after it went without the signal the
+    // privacy policy promises every site. Measured on Edge 155.0.4283.62
+    // (2026-10-22): this feature alone puts `Sec-GPC: 1` on navigations;
+    // `GlobalPrivacyControl` alone does not. An engine without the feature
+    // ignores the name, and the filter's header still covers everything it
+    // sees, as before. The only `--enable-features` here: Chromium keeps the
+    // last of a repeated switch, so a second one would cancel this.
+    " --enable-features=GlobalPrivacyControlForce",
 );
 
 /// The ONE WebView2 environment this process uses.
@@ -2038,6 +2055,8 @@ pub fn build_content(
     // Which profile this tab lives in (kept_profile.rs); the builder was
     // made for the same one by `new_webview_builder_for`.
     profile: crate::kept_profile::ProfileKind,
+    // Built to receive a page's held new-window request (new_window.rs).
+    adopting: bool,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
     // ENGINE-OWNED ZOOM HOTKEYS, on content tabs only.
     //
@@ -2181,15 +2200,26 @@ pub fn build_content(
         // link targets; nothing else about the tab is affected.
         let _ = connect_hover_readout(&webview);
     }
-    connect_request_interception(&webview, state.clone(), malicious_override, proxy.clone(), id);
+    // A tab built to receive a page's held request attaches its filter only
+    // after the hand-over (`release_adoption`): WebView2 honours a filter on a
+    // handed-over webview only when it was attached after the hand-over. The
+    // tab issues nothing before then.
+    let deferred_interception = if adopting {
+        state.borrow_mut().interception_deferred = true;
+        Some((malicious_override, id))
+    } else {
+        connect_request_interception(&webview, state.clone(), malicious_override, proxy.clone(), id);
+        None
+    };
     connect_navigation_events(&webview, state.clone(), proxy, id);
     connect_cert_errors(&webview, state.clone());
+    connect_page_close(&webview, proxy, id);
     // Fingerprint noise. Registered on the raw ICoreWebView2 rather than the
     // wry builder like autofill and GPC above, because this one needs ALL
     // FRAMES -- see install_divergence_script. Before the deferred load_url
     // below for the same reason the handlers are: the first document must
     // not be created before the registration lands.
-    install_divergence_script(&webview, &state, proxy, policy.ephemeral);
+    install_divergence_script(&webview, &state, proxy, policy.ephemeral, id);
     // The local-network boundary's WebSocket half. CONTENT webviews only,
     // which is also what keeps it away from Private Chat: the chat UI is the
     // chrome webview, and Chat and Relay themselves are native Rust sockets
@@ -2198,7 +2228,7 @@ pub fn build_content(
     // The page-scrollbar courtesy: same registration category, same
     // all-frames path, same place in the order so the first document
     // already has it.
-    install_scrollbar_script(&webview, &state);
+    install_scrollbar_script(&webview, &state, proxy, id);
     // YouTube's video ads: same registration path and place in the order, so
     // the first YouTube document already has it. Toggled later by
     // apply_policy.
@@ -2227,6 +2257,20 @@ pub fn build_content(
     } else {
         begin_new_session_wipe(&webview, proxy, profile)
     };
+    // A page's held request waits for every registration's ANSWER
+    // (`TabState::adoption_ready`), and the guard's own overdue timer only
+    // runs when its call was accepted. This one runs regardless, so a tab
+    // whose answers never come retires the request and loads the address
+    // itself instead of staying blank (`AppState::
+    // on_local_network_guard_overdue`). On a tab already released it finds
+    // nothing to do.
+    if adopting {
+        let overdue_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(LOCAL_NETWORK_GUARD_ANSWER_WAIT);
+            let _ = overdue_proxy.send_event(UserEvent::LocalNetworkGuardOverdue(id));
+        });
+    }
     // THE FIRST PAGE ALSO WAITS FOR THE WEBSOCKET GUARD, so it is never
     // issued here. It is released through AppState
     // (`Tab::finish_initial_navigation`) once the wipe, if this tab waits on
@@ -2238,7 +2282,15 @@ pub fn build_content(
     // (`new_tab_allowed`) before the tab existed.
     let _ = url;
     state.borrow_mut().waiting_for_wipe = waiting_for_wipe;
-    Ok((webview, TabView { state, proxy: proxy.clone() }, true))
+    Ok((
+        webview,
+        TabView {
+            state,
+            proxy: proxy.clone(),
+            deferred_interception: RefCell::new(deferred_interception),
+        },
+        true,
+    ))
 }
 
 /// Registers the Fingerprint Divergence script for every document this
@@ -2344,6 +2396,7 @@ fn install_divergence_script(
     state: &Rc<RefCell<TabState>>,
     proxy: &EventLoopProxy<UserEvent>,
     ephemeral: bool,
+    id: u64,
 ) {
     use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
     use wry::WebViewExtWindows;
@@ -2372,6 +2425,9 @@ fn install_divergence_script(
             };
             // The status already sent said Pending; send the answer.
             let _ = tell.send_event(UserEvent::TabStatusChanged);
+            // A page's held request waits for this answer too
+            // (`TabState::adoption_ready`); any other tab finds nothing new.
+            let _ = tell.send_event(UserEvent::LocalNetworkGuardSettled(id));
             Ok(())
         }));
     let result = unsafe {
@@ -2401,21 +2457,42 @@ fn install_divergence_script(
 /// sheet is redundant rather than wrong (both set the same declaration; the
 /// later one wins). That window is one COM round trip at tab creation and
 /// not worth a queue.
-fn install_scrollbar_script(webview: &WebView, state: &Rc<RefCell<TabState>>) {
+fn install_scrollbar_script(
+    webview: &WebView,
+    state: &Rc<RefCell<TabState>>,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+) {
     let rgb = crate::prefs::load().chrome_palette.scrollbar;
-    add_scrollbar_script(webview, state, rgb);
+    add_scrollbar_script(webview, state, rgb, Some((proxy.clone(), id)));
 }
 
-fn add_scrollbar_script(webview: &WebView, state: &Rc<RefCell<TabState>>, rgb: [u8; 3]) {
+/// `settle`: at tab build, the answer is recorded
+/// (`TabState::scrollbar_registration_pending`) and announced, because a
+/// page's held request waits for it (`TabState::adoption_ready`).
+fn add_scrollbar_script(
+    webview: &WebView,
+    state: &Rc<RefCell<TabState>>,
+    rgb: [u8; 3],
+    settle: Option<(EventLoopProxy<UserEvent>, u64)>,
+) {
     use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
     use wry::WebViewExtWindows;
 
     let source = privacy::page_scrollbar_script(rgb);
     let core = webview.webview();
     let source_wide: Vec<u16> = source.encode_utf16().chain(std::iter::once(0)).collect();
+    if settle.is_some() {
+        state.borrow_mut().scrollbar_registration_pending = true;
+    }
     let remember = Rc::clone(state);
+    let answered = settle.clone();
     let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
         move |hr, script_id| {
+            if let Some((proxy, id)) = &answered {
+                remember.borrow_mut().scrollbar_registration_pending = false;
+                let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(*id));
+            }
             if hr.is_err() {
                 diag("page scrollbar: registration REFUSED by the engine; this tab keeps the engine's scrollbar");
                 return Ok(());
@@ -2432,6 +2509,11 @@ fn add_scrollbar_script(webview: &WebView, state: &Rc<RefCell<TabState>>, rgb: [
     };
     if result.is_err() {
         diag("page scrollbar: AddScriptToExecuteOnDocumentCreated call failed; this tab keeps the engine's scrollbar");
+        // No callback will come; the answer is already in.
+        if let Some((proxy, id)) = settle {
+            state.borrow_mut().scrollbar_registration_pending = false;
+            let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(id));
+        }
     }
 }
 
@@ -2481,7 +2563,7 @@ pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
             diag("page scrollbar: could not remove the previous registration; the new one is added beside it");
         }
     }
-    add_scrollbar_script(webview, &view.state, rgb);
+    add_scrollbar_script(webview, &view.state, rgb, None);
 }
 
 /// Receives the two narrowly-shaped messages content scripts post UP from
@@ -3785,11 +3867,82 @@ fn connect_navigation_events(
                                 true
                             }
                         };
+                        // A PAGE'S HANDED-OVER REQUEST (new_window.rs): WebView2
+                        // shows no hop of a handed-over window's first
+                        // navigation to the request filter (WebView2Feedback
+                        // #5293; measured: the POST and the redirect after it
+                        // both left with no Sec-GPC), so they would skip the
+                        // ad and tracker check too. The first hop without a
+                        // body -- the request itself, or the GET a form's
+                        // redirect turns into -- is re-issued here like a
+                        // stripped one, same URL, same carried standing, and
+                        // the re-issue is filtered. A form submission cannot be
+                        // re-issued without losing its body, which is why the
+                        // request was handed over at all: it goes as it is.
+                        // Not when the hop is already refused (a blocked or
+                        // held host): the refusal stands. The flag ends at the
+                        // re-issue or when that first navigation completes.
+                        let unfiltered_first = starting_state.borrow().first_hop_unfiltered && {
+                            let mut refused = windows::core::BOOL(0);
+                            !(args.Cancel(&mut refused).is_ok() && refused.as_bool())
+                        };
+                        // Whether this hop is re-issued for the filter (with
+                        // or without a tracking parameter stripped on the
+                        // way): a re-issue that fails must then not let the
+                        // unfiltered request go (code review round 3, R-002).
+                        let hop = privacy::handover_hop(unfiltered_first, body_bearing, &uri);
+                        let replay = hop == privacy::HandoverHop::Replay;
+                        starting_state.borrow_mut().last_top_level_method =
+                            if body_bearing { "POST" } else { "GET" }.to_string();
+                        // A hop of the page's handed-over navigation that
+                        // carries a body cannot be re-issued without losing
+                        // it, and the filter will not see it: it is judged
+                        // HERE, by the same decision the filter makes for a
+                        // tab's own document -- the local-network boundary
+                        // (code review round 3, R-001), the ad and tracker
+                        // list, the freeze -- and refused the same way.
+                        if hop == privacy::HandoverHop::Judge {
+                            let decision = {
+                                let mut st = starting_state.borrow_mut();
+                                let override_host = st.adlist_override_host();
+                                st.decide_intercepted(
+                                    Some(&uri),
+                                    true,
+                                    false,
+                                    privacy::bundled_rules(),
+                                    Instant::now(),
+                                    override_host.as_deref(),
+                                )
+                                .0
+                            };
+                            if let privacy::RequestDecision::Block(reason) = decision {
+                                let _ = args.SetCancel(true);
+                                diag(&format!(
+                                    "new window: the page's request was refused ({reason:?}) before it was sent"
+                                ));
+                                // The ad list's refusal gets the banner any
+                                // tab's refused page gets, with the method,
+                                // so it says a form cannot be sent again
+                                // (code review round 4, R-002).
+                                if reason == privacy::BlockReason::AdRule {
+                                    let _ = ads_proxy.send_event(UserEvent::AdlistBlocked {
+                                        tab_id: id,
+                                        url: uri.clone(),
+                                        host: privacy::host_of(&uri).unwrap_or_default(),
+                                        method: "POST".to_string(),
+                                    });
+                                }
+                                return Ok(());
+                            }
+                        }
                         if let Some(clean) =
                             {
-                                starting_state.borrow_mut().last_top_level_method =
-                                    if body_bearing { "POST" } else { "GET" }.to_string();
-                                (!body_bearing).then(|| crate::ipc::navigation_strip_target(&uri)).flatten()
+                                (!body_bearing)
+                                    .then(|| {
+                                        crate::ipc::navigation_strip_target(&uri)
+                                            .or_else(|| replay.then(|| uri.clone()))
+                                    })
+                                    .flatten()
                             }
                         {
                             let mut wide: Vec<u16> =
@@ -3802,6 +3955,9 @@ fn connect_navigation_events(
                             // let a refused redirect through or refuse an
                             // allowed one (plan review 2, M-5).
                             starting_state.borrow_mut().expect_navigation(&clean, start);
+                            // Re-issued through the filter, the page's first
+                            // navigation needs no more of this.
+                            starting_state.borrow_mut().first_hop_unfiltered = false;
                             match navigating.Navigate(target) {
                                 Ok(()) => {
                                     let _ = args.SetCancel(true);
@@ -3812,6 +3968,17 @@ fn connect_navigation_events(
                                 // tracked page beats no page. The carried
                                 // expectation goes with the navigation that
                                 // never started.
+                                Err(error) if replay => {
+                                    // The page's request never passed the
+                                    // filter: it does not go at all (code
+                                    // review round 2, R-001).
+                                    starting_state.borrow_mut().forget_expected_navigation();
+                                    let _ = args.SetCancel(true);
+                                    diag(&format!(
+                                        "new window: re-issue FAILED ({error}); the page's request was not sent"
+                                    ));
+                                    return Ok(());
+                                }
                                 Err(error) => {
                                     starting_state.borrow_mut().forget_expected_navigation();
                                     diag(&format!(
@@ -3953,32 +4120,99 @@ fn connect_navigation_events(
                     "navigation: add_ContentLoading FAILED ({error}); local pages will not load from their own address in this tab, and frames that never report completion keep their address refused"
                 ));
             }
-            // A PAGE'S NEW TAB is judged by the page that asked, WHEN it
-            // asked. wry takes this event's deferral and runs the app's
-            // callback later from the message loop (wry 0.55.1
-            // webview2/mod.rs, `dispatch_handler`), by which time a
-            // navigation already in flight may have committed a more
-            // permissive page (final review 6, R-002). This handler runs in
-            // the event itself, like wry's, before that callback can, and
-            // records only refusals (`TabState::on_new_window_requested`).
-            // Until it is registered, no private address opens in a new tab.
+            // A PAGE'S NEW TAB, decided here and only here (wry is given no
+            // new-window callback on Windows, so its own handler just marks
+            // every request handled with no window; see build_tab_as).
+            //
+            // Judged by the page that asked, WHEN it asked, in the event
+            // itself: the verdict on a local address is recorded and taken in
+            // the same moment (`TabState::on_new_window_requested`,
+            // `take_new_window_verdict`), so no navigation can commit a more
+            // permissive page in between (final review 6, R-002). The address
+            // must pass the same predicate as every navigation
+            // (`is_allowed_content_url`): the chrome origin and file:// never
+            // get a tab.
+            //
+            // An allowed request is HELD, not re-issued: the engine keeps the
+            // page's own navigation -- a form's POST body, the referrer, the
+            // opener -- on a deferral until AppState builds the tab that
+            // receives it (`UserEvent::AdoptNewWindow`, new_window.rs). The
+            // tab is built from the message loop, never inside this event,
+            // which WebView2 documents as a deadlock. Re-issuing the address
+            // as a fresh page load is what lost Google Flights' booking
+            // hand-off to the airline.
+            //
+            // Until this is registered, no page opens a tab at all.
             let window_state = state.clone();
+            let window_proxy = proxy.clone();
             let mut window_token = Default::default();
             match core.add_NewWindowRequested(
                 &NewWindowRequestedEventHandler::create(Box::new(move |_sender, args| {
-                    let url = args.as_ref().and_then(|args| {
+                    let Some(args) = args else {
+                        window_state.borrow_mut().on_new_window_requested(None);
+                        return Ok(());
+                    };
+                    // No window unless one is handed over later. wry's handler
+                    // says the same; this does not depend on running after it.
+                    let _ = args.SetHandled(true);
+                    let url = {
                         let mut uri = windows::core::PWSTR::null();
-                        args.Uri(&mut uri).ok()?;
-                        Some(webview2_com::take_pwstr(uri))
-                    });
-                    window_state.borrow_mut().on_new_window_requested(url.as_deref());
+                        args.Uri(&mut uri).ok().map(|()| webview2_com::take_pwstr(uri))
+                    };
+                    let Some(url) = url else {
+                        window_state.borrow_mut().on_new_window_requested(None);
+                        return Ok(());
+                    };
+                    let allowed = {
+                        let mut st = window_state.borrow_mut();
+                        st.on_new_window_requested(Some(&url));
+                        st.take_new_window_verdict(&url)
+                    };
+                    if !allowed || !crate::state::is_allowed_content_url(&url) {
+                        return Ok(());
+                    }
+                    // A click (or a key) opened it: the tab comes to the front,
+                    // as in every browser; a page that opens one by itself, on
+                    // load or on a timer, gets a background tab. An unreadable
+                    // answer is the background.
+                    let user_initiated = {
+                        let mut user = windows::core::BOOL(0);
+                        args.IsUserInitiated(&mut user).is_ok() && user.as_bool()
+                    };
+                    // Not every page's request is handed over: not from a
+                    // page that may not hand one over (`TabState::
+                    // may_hand_over`), not to a listed destination
+                    // (`handover_destination_clean`), and not on an engine
+                    // not known to send Global Privacy Control itself
+                    // (`engine_sends_gpc_itself`). The rest load the
+                    // address in a tab of their own, as every page's tab used
+                    // to, through the filter and its banners.
+                    let clean = privacy::handover_destination_clean(
+                        &url,
+                        window_state.borrow().policy.block_ads,
+                        privacy::bundled_rules(),
+                        |host| crate::blocklist::matched_rule(host).is_some(),
+                    );
+                    if !clean || !window_state.borrow().may_hand_over() || !engine_sends_gpc_itself() {
+                        let _ = window_proxy.send_event(UserEvent::OpenInNewTab {
+                            opener: id,
+                            url,
+                            allowed,
+                            front: user_initiated,
+                        });
+                        return Ok(());
+                    }
+                    let Ok(deferral) = args.GetDeferral() else {
+                        return Ok(());
+                    };
+                    hold_new_window(args, deferral, &window_proxy, id, url, user_initiated);
                     Ok(())
                 })),
                 &mut window_token,
             ) {
                 Ok(()) => state.borrow_mut().new_window_tracking = true,
                 Err(error) => diag(&format!(
-                    "navigation: add_NewWindowRequested FAILED ({error}); pages in this tab cannot open a local address in a new tab"
+                    "navigation: add_NewWindowRequested FAILED ({error}); pages in this tab cannot open new tabs"
                 )),
             }
         }
@@ -3990,6 +4224,10 @@ fn connect_navigation_events(
                 // Success and failure both count as finished: a failed load
                 // must not leave the tab permanently unfreezable.
                 state.borrow_mut().on_load_finished(Instant::now());
+                // A handed-over first navigation that needed no re-issue (a
+                // form whose answer is the page itself, about:blank) is over:
+                // nothing later in this tab is re-issued on its account.
+                state.borrow_mut().first_hop_unfiltered = false;
                 // A finished navigation can no longer explain a request;
                 // leaving it would let a later same-URL iframe be taken for
                 // the page.
@@ -6812,10 +7050,266 @@ pub fn new_tab_gate(view: &TabView) -> NewTabGate {
     NewTabGate(view.state.clone())
 }
 
+// ---------------------------------------------------------------------------
+// A PAGE'S HELD NEW-WINDOW REQUEST (new_window.rs)
+//
+// The engine event (`connect_navigation_events`) takes a deferral and parks the
+// request here; AppState builds a tab for it from the message loop and hands
+// the request over in `release_adoption`, in the order WebView2 documents for
+// `put_NewWindow`: the new webview is in the opener's environment and profile
+// and has never navigated; every document-start script it needs has completed;
+// the hand-over; THEN the request filter (`add_WebResourceRequested` "has to be
+// called after setting NewWindow"); then the deferral completes and the engine
+// navigates the new tab with the page's own request.
+//
+// Every held request is answered exactly once. Dropping a `PendingWindow`
+// completes its deferral with no window, so a request that is refused, over
+// the cap, whose tab failed to build, closed or was sent elsewhere first, or
+// whose release never came, still lets the page go on.
+// ---------------------------------------------------------------------------
+
+struct PendingWindow {
+    args: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NewWindowRequestedEventArgs,
+    deferral: Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Deferral>,
+}
+
+impl PendingWindow {
+    /// Lets the engine go on: with the handed-over webview if `SetNewWindow`
+    /// succeeded, with no window otherwise.
+    fn complete(mut self) {
+        if let Some(deferral) = self.deferral.take() {
+            // SAFETY: COM call on the UI thread that owns the deferral.
+            let _ = unsafe { deferral.Complete() };
+        }
+    }
+}
+
+impl Drop for PendingWindow {
+    fn drop(&mut self) {
+        if let Some(deferral) = self.deferral.take() {
+            // SAFETY: as above.
+            let _ = unsafe { deferral.Complete() };
+        }
+    }
+}
+
+thread_local! {
+    /// UI thread only, like every COM object in it.
+    static PENDING_WINDOWS: RefCell<crate::new_window::PendingTable<PendingWindow>> =
+        RefCell::new(Default::default());
+}
+
+/// Out of the table first, so the caller drops it (a COM call) outside the
+/// borrow.
+fn take_pending_window(token: u64) -> Option<PendingWindow> {
+    PENDING_WINDOWS.with(|table| table.borrow_mut().take(token))
+}
+
+/// Parks an allowed request and asks AppState for a tab to receive it.
+fn hold_new_window(
+    args: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2NewWindowRequestedEventArgs,
+    deferral: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Deferral,
+    proxy: &EventLoopProxy<UserEvent>,
+    opener: u64,
+    url: String,
+    user_initiated: bool,
+) {
+    let held = PendingWindow {
+        args,
+        deferral: Some(deferral),
+    };
+    let inserted = PENDING_WINDOWS.with(|table| table.borrow_mut().insert(held));
+    match inserted {
+        Ok(token) => {
+            if proxy
+                .send_event(UserEvent::AdoptNewWindow {
+                    opener,
+                    url,
+                    token,
+                    user_initiated,
+                })
+                .is_err()
+            {
+                drop(take_pending_window(token));
+            }
+        }
+        Err(refused) => {
+            diag("new window: too many page requests waiting for a tab; this one gets none");
+            drop(refused);
+        }
+    }
+}
+
+/// The oldest engine measured sending `Sec-GPC` itself under
+/// `GlobalPrivacyControlForce` (BROWSER_ARGS): Edge/WebView2 155.0.4283.62,
+/// on the Windows 11 VM, 2026-10-22.
+const GPC_FLAG_MEASURED: [u32; 4] = [155, 0, 4283, 62];
+
+/// Whether every engine running here is known to send Global Privacy Control
+/// on its own. A handed-over request reaches no request filter, so the engine
+/// is the only thing that can put the signal on it; on an engine not known to
+/// do that, or whose version could not be read, a page's request is not
+/// handed over (compliance audit 2026-10-22: the privacy policy promises the
+/// signal to every site). The lowest version seen is what counts.
+static GPC_ENGINE_UNPROVEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn engine_sends_gpc_itself() -> bool {
+    if GPC_ENGINE_UNPROVEN.load(std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    let Ok(running) = RUNNING_ENGINE.lock() else {
+        return false;
+    };
+    matches!(&*running, crate::platform::RunningVersion::Known(found)
+        if found.len() >= GPC_FLAG_MEASURED.len()
+            && !crate::platform::below_floor(found, &GPC_FLAG_MEASURED))
+}
+
+/// A held request, owned by the tab built to receive it. Dropping it answers
+/// the page with no window.
+pub struct AdoptionTicket(u64);
+
+impl Drop for AdoptionTicket {
+    fn drop(&mut self) {
+        drop(take_pending_window(self.0));
+    }
+}
+
+/// Takes charge of the request `token` names. A ticket dropped unused, or a
+/// token already answered, costs nothing.
+pub fn adoption_ticket(token: u64) -> AdoptionTicket {
+    AdoptionTicket(token)
+}
+
+/// The builder for a tab receiving a page's held request: the OPENER's own
+/// engine environment, which WebView2 requires of the webview it is handed.
+pub fn on_opener_environment<'a>(builder: WebViewBuilder<'a>, opener: &WebView) -> WebViewBuilder<'a> {
+    use wry::WebViewExtWindows;
+    builder.with_environment(opener.environment())
+}
+
+/// Whether this tab can carry a handed-over request at all
+/// (`TabState::handover_guarded`).
+pub fn handover_guarded(view: &TabView) -> bool {
+    view.state.borrow().handover_guarded()
+}
+
+/// Whether a page's held request may be handed over now
+/// (`TabState::adoption_ready`).
+pub fn adoption_ready(view: &TabView) -> bool {
+    view.state.borrow().adoption_ready()
+}
+
+/// Whether the engine has answered every registration made at tab build
+/// (`TabState::registrations_answered`).
+pub fn registrations_answered(view: &TabView) -> bool {
+    view.state.borrow().registrations_answered()
+}
+
+/// Attaches the request filter of a tab built to receive a page's request,
+/// if it has not been attached yet, and says whether the tab may load
+/// anything. True on every other tab, whose filter was attached at build.
+///
+/// False for a kept tab whose filter did not register: a kept tab never runs
+/// without its boundary, which `build_tab` checks at build for every other
+/// kept tab and which has to be checked here, the first moment the filter
+/// exists, on EVERY path this tab can take -- the hand-over, the hand-over
+/// refused, the overdue timer, a typed address (code review, R-001). The tab
+/// is closed; nothing has loaded in it.
+pub fn attach_deferred_interception(webview: &WebView, view: &TabView) -> bool {
+    let Some((malicious_override, id)) = view.deferred_interception.borrow_mut().take() else {
+        return true;
+    };
+    view.state.borrow_mut().interception_deferred = false;
+    connect_request_interception(webview, view.state.clone(), malicious_override, view.proxy.clone(), id);
+    if view.state.borrow().profile == crate::kept_profile::ProfileKind::Kept && !kept_boundary_ready(view) {
+        diag("new window: a kept tab's request filter did not register; the tab was closed before it loaded");
+        // Shut now, not when the close is processed: nothing may load in it
+        // in between (code review round 2, R-002).
+        use wry::WebViewExtWindows;
+        // SAFETY: COM call on the UI thread, outside any engine callback.
+        let _ = unsafe { webview.controller().Close() };
+        let _ = view.proxy.send_event(UserEvent::PageClosedTab(id));
+        return false;
+    }
+    true
+}
+
+/// Hands the page's held request to this tab. True when it was handed over
+/// (or the tab was shut for want of a boundary, see below): the engine now
+/// owns the first navigation and the caller issues nothing. False when it was
+/// not -- the request is gone or the engine refused the hand-over -- and the
+/// page has been answered with no window; the caller loads the address in
+/// this tab itself.
+pub fn release_adoption(webview: &WebView, view: &TabView, ticket: AdoptionTicket) -> bool {
+    use wry::WebViewExtWindows;
+    let token = ticket.0;
+    // The ticket's own drop would answer the request: it is being answered
+    // here instead.
+    std::mem::forget(ticket);
+    let Some(held) = take_pending_window(token) else {
+        return false;
+    };
+    let core = webview.webview();
+    // SAFETY: COM call on the UI thread, outside any engine callback.
+    if let Err(error) = unsafe { held.args.SetNewWindow(&core) } {
+        diag(&format!(
+            "new window: the engine refused the hand-over ({error}); the tab loads the address itself"
+        ));
+        drop(held);
+        return false;
+    }
+    // AFTER the hand-over, as WebView2 requires of a request filter. A kept
+    // tab whose filter did not register is being closed; the hand-over cannot
+    // be undone, so the webview is shut BEFORE the request is let go and
+    // nothing loads.
+    if !attach_deferred_interception(webview, view) {
+        // Already shut by the attach; only now is the request let go.
+        drop(held);
+        return true;
+    }
+    // The engine shows the handed-over request to no filter; the first
+    // top-level hop is re-issued in NavigationStarting unless it carries a
+    // body (`TabState::first_hop_unfiltered`).
+    view.state.borrow_mut().first_hop_unfiltered = true;
+    held.complete();
+    true
+}
+
+/// A page's `window.close()`, which the engine honours only for a window a
+/// script opened: wry destroys the view's container (vendor/wry
+/// webview2/mod.rs, WindowCloseRequested), and this tells AppState to close
+/// the tab, so no dead tab is left in the strip.
+fn connect_page_close(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: u64) {
+    use webview2_com::WindowCloseRequestedEventHandler;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let closing = proxy.clone();
+    let mut token = Default::default();
+    // SAFETY: COM event registration; the handler runs on the UI thread.
+    let result = unsafe {
+        core.add_WindowCloseRequested(
+            &WindowCloseRequestedEventHandler::create(Box::new(move |_sender, _args| {
+                let _ = closing.send_event(UserEvent::PageClosedTab(id));
+                Ok(())
+            })),
+            &mut token,
+        )
+    };
+    if let Err(error) = result {
+        diag(&format!(
+            "page close: add_WindowCloseRequested FAILED ({error}); a page that closes itself leaves an empty tab"
+        ));
+    }
+}
+
 /// Whether the page that asked may open a new tab at `url`: judged when the
 /// engine raised the request AND by the page on screen now
 /// (`TabState::take_new_window_verdict`). Called once per request wry
 /// queues. No gate yet means no page yet, and nothing private is vouched for.
+/// WebKitGTK's path; Windows judges in the engine event itself.
+#[allow(dead_code)]
 pub fn new_tab_allowed(gate: Option<&NewTabGate>, url: &str) -> bool {
     match gate {
         Some(gate) => gate.0.borrow_mut().take_new_window_verdict(url),
@@ -8353,6 +8847,17 @@ fn note_running_environment(webview: &WebView) {
             crate::platform::join_version(v)
         )),
         None => diag("engine: live environment version could not be read; running version is unknown"),
+    }
+    // Every environment's own report, for the hand-over's GPC gate: one
+    // unreadable, incomplete or older report makes the gate refuse for the
+    // rest of the session, whatever the others say (code review round 5,
+    // R-001). The merged minimum below keeps a readable version when another
+    // read fails, which is right for the engine advisory and wrong here.
+    let proven = observed.as_ref().is_some_and(|found| {
+        found.len() == GPC_FLAG_MEASURED.len() && !crate::platform::below_floor(found, &GPC_FLAG_MEASURED)
+    });
+    if !proven {
+        GPC_ENGINE_UNPROVEN.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     if let Ok(mut guard) = RUNNING_ENGINE.lock() {
         let current = std::mem::replace(&mut *guard, crate::platform::RunningVersion::Unknown);

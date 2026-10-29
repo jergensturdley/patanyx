@@ -106,6 +106,14 @@ cargo test -p patanyx --features chat --locked
 # reconnect, backoff, the drain that stops frames surviving a reconnect -- was
 # covered by either line above. It had never run in CI at all.
 cargo test -p patanyx-chat --features relay-client --locked
+# The app as the Nabu-X build ships it: chat AND the relay client together.
+# Neither line above enables both in the app crate.
+cargo test -p patanyx --features chat,relay-client --locked
+# Every TLS crate at or above its security floor, in every shipped profile on
+# both targets (the eMudhra distrust and the rustls fixes, October 2026). The
+# self-test runs first so a gate that has stopped refusing fails loudly.
+python3 ./scripts/check-tls-floor.py --self-test
+python3 ./scripts/check-tls-floor.py
 # The chrome scripts are EXECUTED, not parsed: node --check validates syntax
 # and has already let a load-time ReferenceError ship. Also bans innerHTML in
 # the webview that holds IPC and the vault. Its partner-gate entry drives all
@@ -184,7 +192,7 @@ python3 ./scripts/check-cargo-sources.py
 # The literal is deliberate and moves by hand with every Cargo bump (release
 # procedure step 1). Deriving it from Cargo.toml would reduce the release-identity check
 # to comparing Cargo.toml with itself; 1.0.1 shipped with this still at 1.0.0.
-EXPECTED_VERSION=1.0.7 ./scripts/check-version.sh
+EXPECTED_VERSION=1.0.8 ./scripts/check-version.sh
 # The About panel names every third-party package compiled into the binary, and
 # that list is a checked-in file. Add a dependency without regenerating it and
 # the browser confidently attributes a set of software it is no longer built

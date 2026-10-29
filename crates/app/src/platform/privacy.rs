@@ -1503,6 +1503,23 @@ pub struct TabState {
     /// What the engine did with this tab's Fingerprint Divergence script,
     /// set once at tab build (the script cannot be added to a live tab).
     pub divergence_install: ScriptInstall,
+    /// Windows: the page-scrollbar registration made at tab build has not
+    /// been answered yet. Only a tab receiving a page's held request waits
+    /// on it (`adoption_ready`); every other first page is issued after it
+    /// over the same COM channel and needs no answer.
+    pub scrollbar_registration_pending: bool,
+    /// Windows: this tab was built to receive a page's held request, and its
+    /// request filter is attached only once that request is handed over --
+    /// WebView2 honours a filter on a handed-over webview only when it was
+    /// attached after the hand-over. Until then the tab issues nothing.
+    pub interception_deferred: bool,
+    /// Windows: the next top-level navigation is the page's own request,
+    /// handed over to this tab (new_window.rs), which WebView2 never shows to
+    /// the request filter (WebView2Feedback #5293: no WebResourceRequested
+    /// for the first document of a handed-over window). NavigationStarting
+    /// re-issues it, when it is not a form submission, so it is filtered,
+    /// carries Sec-GPC and passes the ad and tracker list like any other.
+    pub first_hop_unfiltered: bool,
     /// "Allow ads and trackers on this tab", while it is on. Memory only and
     /// per tab: it is dropped with this struct, which is dropped with the tab,
     /// and nothing serializes it.
@@ -1782,6 +1799,9 @@ impl TabState {
             youtube_script_ids: Vec::new(),
             youtube_script_adding: false,
             divergence_install: ScriptInstall::NotWanted,
+            scrollbar_registration_pending: false,
+            interception_deferred: false,
+            first_hop_unfiltered: false,
             ads_allowance: None,
         }
     }
@@ -2124,6 +2144,62 @@ impl TabState {
         !self.waiting_for_wipe
             && self.local_network_guard != SettingState::NotAttempted
             && !self.youtube_script_adding
+    }
+
+    /// Whether a page's held request may be handed to this tab
+    /// (new_window.rs): `initial_navigation_ready`, AND every script the
+    /// first document needs has been answered by the engine. WebView2 runs a
+    /// script in a handed-over webview only if its registration COMPLETED
+    /// before the hand-over, so here an answer is required for each one, not
+    /// an order of calls. The guard and YouTube answers are already in
+    /// `initial_navigation_ready`; that the guard's was a real answer and not
+    /// the overdue timer's is held by the caller, which retires the request
+    /// before the timer can release anything (`AppState::
+    /// on_local_network_guard_overdue`).
+    /// Whether this tab can carry a page's handed-over request at all: its
+    /// NavigationStarting handler registered, because that handler is the
+    /// only thing that judges the hops the request filter never sees (code
+    /// review round 5, R-002). Known at build; a tab without it retires the
+    /// request and loads the address through the filter instead.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn handover_guarded(&self) -> bool {
+        self.navigation_tracking == SettingState::Applied
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn adoption_ready(&self) -> bool {
+        self.initial_navigation_ready() && self.registrations_answered()
+    }
+
+    /// Whether a page's new-tab request may be handed over WITH the request
+    /// (new_window.rs), which also gives the page a live handle on the new
+    /// tab. Only from a document this tab can name that was not loaded over
+    /// plain HTTP, and only in the ordinary profile:
+    ///
+    /// - A plain-HTTP page holding a handle could write into a blank tab of
+    ///   its own making and have it reach the local network, which a blank
+    ///   document's standing does not refuse (code review round 2, R-003).
+    /// - WebView2 shows no hop of a handed-over navigation to the request
+    ///   filter (WebView2Feedback #5293), and a form's redirect cannot be
+    ///   told from a re-posted one, so a kept tab could have a redirect carry
+    ///   another site's data into kept storage unseen (round 2, R-004).
+    ///
+    /// Every other page's new tab loads its address, as before.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn may_hand_over(&self) -> bool {
+        self.profile == crate::kept_profile::ProfileKind::Main
+            && self.committed.as_ref().is_some_and(|standing| !standing.insecure)
+    }
+
+    /// Whether the engine has answered every document-start registration made
+    /// at tab build: the WebSocket guard, the YouTube ad script, the
+    /// divergence script and the page scrollbar. A refusal is an answer.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn registrations_answered(&self) -> bool {
+        self.local_network_guard != SettingState::NotAttempted
+            && !self.youtube_script_adding
+            && self.divergence_install != ScriptInstall::Pending
+            && !self.scrollbar_registration_pending
     }
 
     /// What to do with this tab's YouTube ad script registration (Windows,
@@ -3275,6 +3351,138 @@ pub fn page_scrollbar_script(rgb: [u8; 3]) -> String {
         css = page_scrollbar_css(rgb),
         kind = PAGE_SCROLLBAR_MESSAGE_KIND,
     )
+}
+
+// ---------------------------------------------------------------------------
+// A PAGE'S HANDED-OVER REQUEST (new_window.rs): the pure rules
+//
+// WebView2 shows the request filter no hop of the first navigation of a
+// window a page opened (WebView2Feedback #5293). These say what is handed
+// over at all, and what NavigationStarting does with each hop the filter will
+// not see; the engine glue in windows.rs only carries them out.
+// ---------------------------------------------------------------------------
+
+/// What NavigationStarting does with a top-level hop.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoverHop {
+    /// Not a hop the filter misses: everything as before.
+    Ordinary,
+    /// No body: cancelled and issued again, so the filter sees it. A re-issue
+    /// that fails sends nothing.
+    Replay,
+    /// Carries a body, which a re-issue would lose: judged on the spot by the
+    /// filter's own decision for a tab's document, and cancelled if refused.
+    Judge,
+}
+
+/// `unfiltered`: the hop belongs to a handed-over navigation the filter has
+/// not seen, and nothing has already refused it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn handover_hop(unfiltered: bool, body_bearing: bool, uri: &str) -> HandoverHop {
+    if !unfiltered {
+        return HandoverHop::Ordinary;
+    }
+    if !body_bearing && (uri.starts_with("https://") || uri.starts_with("http://")) {
+        HandoverHop::Replay
+    } else {
+        HandoverHop::Judge
+    }
+}
+
+/// Whether a page's request may be handed over to a new tab at all, by its
+/// destination: never to a host on the malicious-site list or, while the
+/// asking tab blocks ads, the ad and tracker list. Those load their address
+/// in a tab of their own, through the filter, and get the banners every
+/// other refused page gets -- rather than reaching the engine first and being
+/// cancelled afterwards (code review round 4, R-001).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn handover_destination_clean(
+    url: &str,
+    block_ads: bool,
+    rules: &RuleSet,
+    malicious: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(host) = host_of(url) else {
+        return true;
+    };
+    if malicious(&host) {
+        return false;
+    }
+    !(block_ads && rules.blocks_host(&host))
+}
+
+#[cfg(test)]
+mod handover_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_unseen_hop_is_touched() {
+        for body in [false, true] {
+            for uri in ["https://a.example/", "http://a.example/", "about:blank"] {
+                assert_eq!(handover_hop(false, body, uri), HandoverHop::Ordinary);
+            }
+        }
+    }
+
+    #[test]
+    fn a_hop_without_a_body_is_replayed_through_the_filter() {
+        assert_eq!(handover_hop(true, false, "https://www.delta.com/x?utm_source=g"), HandoverHop::Replay);
+        assert_eq!(handover_hop(true, false, "http://192.168.1.1/"), HandoverHop::Replay);
+    }
+
+    #[test]
+    fn a_hop_with_a_body_is_judged_never_replayed() {
+        // Replaying would turn the POST into a GET and lose what was posted.
+        assert_eq!(handover_hop(true, true, "https://www.google.com/travel/clk/f?t=1"), HandoverHop::Judge);
+        // Nothing to re-issue for a non-network address; judged instead.
+        assert_eq!(handover_hop(true, false, "about:blank"), HandoverHop::Judge);
+    }
+
+    #[test]
+    fn a_listed_destination_is_never_handed_over() {
+        let rules = RuleSet::from_lines("tracker.example\n");
+        let malicious = |host: &str| host == "bad.example";
+        assert!(handover_destination_clean("https://www.delta.com/", true, &rules, malicious));
+        assert!(!handover_destination_clean("https://ads.tracker.example/c", true, &rules, malicious));
+        // With blocking off in the asking tab, the ad list does not apply...
+        assert!(handover_destination_clean("https://ads.tracker.example/c", false, &rules, malicious));
+        // ...the malicious-site list always does.
+        assert!(!handover_destination_clean("https://bad.example/", false, &rules, malicious));
+        assert!(handover_destination_clean("about:blank", true, &rules, malicious));
+    }
+
+    /// A tab whose NavigationStarting handler did not register cannot carry a
+    /// handed-over request; one where it did, can.
+    #[test]
+    fn only_a_guarded_tab_carries_a_handed_over_request() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.handover_guarded(), "not registered yet");
+        st.navigation_tracking = SettingState::Failed;
+        assert!(!st.handover_guarded());
+        st.navigation_tracking = SettingState::Applied;
+        assert!(st.handover_guarded());
+    }
+
+    /// The decision a judged hop gets is the filter's own for a tab's
+    /// document: refused for the ad list and for a local address the hop may
+    /// not reach, allowed otherwise.
+    #[test]
+    fn a_judged_hop_gets_the_filters_decision() {
+        let rules = RuleSet::from_lines("tracker.example\n");
+        let now = Instant::now();
+        let mut st = TabState::new(&TabPolicy::default());
+        let start = st.on_top_level_navigation_starting(Some(1), "https://ads.tracker.example/c");
+        assert!(start.reaches_private);
+        let (decision, _) =
+            st.decide_intercepted(Some("https://ads.tracker.example/c"), true, false, &rules, now, None);
+        assert_eq!(decision, RequestDecision::Block(BlockReason::AdRule));
+
+        let mut st = TabState::new(&TabPolicy::default());
+        let _ = st.on_top_level_navigation_starting(Some(2), "https://www.delta.com/x");
+        let (decision, _) = st.decide_intercepted(Some("https://www.delta.com/x"), true, false, &rules, now, None);
+        assert_eq!(decision, RequestDecision::Allow);
+    }
 }
 
 #[cfg(test)]

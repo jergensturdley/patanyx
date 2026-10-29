@@ -1039,10 +1039,36 @@ mod wiring {
     fn a_foreground_tab_from_the_browser_marks_and_a_pages_window_open_does_not() {
         let body = method(STATE_RS, "pub fn new_tab(&mut self, url: &str, switch: bool)");
         assert!(body.contains("if switch {\nself.duplicate_sites.note_user_navigation(id);\n}"));
-        // window.open arrives as a background tab and nothing marks it.
-        let arm = code(MAIN_RS, "Event::UserEvent(UserEvent::OpenInNewTab { url, allowed }) => {", "\n            }\n");
-        assert!(arm.contains("app.new_tab(&url, false);"), "a page's window.open must not open a foreground tab");
+        // window.open arrives as a background tab and nothing marks it, on
+        // both paths a page's tab takes (WebKitGTK loads the address,
+        // Windows hands the page's own request over), which share one way in.
+        let arm = code(MAIN_RS, "Event::UserEvent(UserEvent::OpenInNewTab { opener, url, allowed, front }) => {", "\n            }\n");
+        assert!(arm.contains("app.open_page_tab(opener, &url, front);"));
+        // WebKitGTK cannot tell a click from a page's own call: background.
+        assert!(include_str!("state.rs").contains("allowed,\n                    front: false,\n                });"));
         assert!(!arm.contains("note_user_navigation"), "a page's window.open must never mark");
+        let adopt_arm = code(
+            MAIN_RS,
+            "Event::UserEvent(UserEvent::AdoptNewWindow { opener, url, token, user_initiated }) => {",
+            "\n            }\n",
+        );
+        assert!(adopt_arm.contains("app.adopt_new_window(opener, &url, token, user_initiated);"));
+        assert!(!adopt_arm.contains("note_user_navigation"), "a page's window.open must never mark");
+        for (name, path) in [
+            ("open_page_tab", "pub fn open_page_tab(&mut self, opener: u64, url: &str, front: bool)"),
+            ("adopt_new_window", "pub fn adopt_new_window(&mut self, opener: u64, url: &str, token: u64, front: bool)"),
+        ] {
+            let body = method(STATE_RS, path);
+            assert!(body.contains("self.push_page_tab("), "{name} adds its tab another way");
+            assert!(!body.contains("note_user_navigation"), "{name} marks a page's tab");
+        }
+        let push = method(STATE_RS, "fn push_page_tab(");
+        assert!(!push.contains("note_user_navigation"), "a page's tab must never mark");
+        // In front only on the user's own click (the engine's IsUserInitiated).
+        assert!(push.contains("} else if front {\nlet index = self.tabs.len() - 1;\nself.set_active(index);"));
+        assert!(push.contains("self.focus_url_bar_for_blank_tab(front, url);"));
+        let event = code(include_str!("platform/windows.rs"), "let user_initiated = {", "};");
+        assert!(event.contains("args.IsUserInitiated(&mut user).is_ok() && user.as_bool()"));
     }
 
     #[test]

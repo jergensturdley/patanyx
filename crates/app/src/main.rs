@@ -144,6 +144,8 @@ mod updater;
 /// The Vault backup: the vault and the whole Library in one encrypted file,
 /// and the journaled import that replaces both.
 mod vault_backup;
+/// Page-opened windows held while the tab that receives them is built.
+mod new_window;
 mod window_frame;
 
 /// Set on a replacement started by this binary (updater.rs `relaunch`).
@@ -231,8 +233,28 @@ enum UserEvent {
     /// A page asked for a new tab (window.open, target=_blank). `allowed` is
     /// the verdict on a local address, taken in the callback that queued this
     /// from what the engine event recorded when the page asked
-    /// (`platform::new_tab_allowed`).
-    OpenInNewTab { url: String, allowed: bool },
+    /// (`platform::new_tab_allowed`). `opener` is the asking tab, whose
+    /// privacy preset the new tab keeps (`AppState::page_tab_policy`).
+    /// WebKitGTK, and on Windows a page whose request is not handed over
+    /// (`TabState::may_hand_over`; the rest arrive as `AdoptNewWindow`).
+    /// `front`: a click opened it (Windows reads the engine's
+    /// IsUserInitiated; WebKitGTK cannot say and passes false).
+    OpenInNewTab { opener: u64, url: String, allowed: bool, front: bool },
+    /// Windows: a page asked for a new tab and the engine is holding the
+    /// request, method, body and opener included, until a tab is built to
+    /// receive it (new_window.rs). `token` names the held request; the local
+    /// address verdict was taken in the engine event and only allowed
+    /// requests are held.
+    /// `user_initiated`: the engine says a click or key opened it, and the
+    /// tab comes to the front.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    AdoptNewWindow { opener: u64, url: String, token: u64, user_initiated: bool },
+    /// A page in this tab called `window.close()` and the engine agreed (it
+    /// does for a window a script opened, and for a tab that has shown only
+    /// one page), or a kept tab built for a page's request could not get its
+    /// request filter. The tab is closed like any other.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    PageClosedTab(u64),
     /// The behavioural blocking probe has had long enough to load.
     ProbeDone,
     DownloadStarted(String),
@@ -1983,7 +2005,16 @@ fn main() {
             Event::UserEvent(UserEvent::TitleChanged(id, title)) => {
                 app.on_title_changed(id, title)
             }
-            Event::UserEvent(UserEvent::OpenInNewTab { url, allowed }) => {
+            #[cfg(windows)]
+            Event::UserEvent(UserEvent::AdoptNewWindow { opener, url, token, user_initiated }) => {
+                // The same sink checks as the path below, inside
+                // adopt_new_window; a refusal answers the page with no window.
+                app.adopt_new_window(opener, &url, token, user_initiated);
+            }
+            Event::UserEvent(UserEvent::PageClosedTab(id)) => {
+                let _ = app.close_tab(id);
+            }
+            Event::UserEvent(UserEvent::OpenInNewTab { opener, url, allowed, front }) => {
                 // Re-checked at the sink as well as at the source. The source
                 // is a wry callback on the content webview, so it is the half
                 // of this path an untrusted page gets to talk to; validating
@@ -2004,7 +2035,7 @@ fn main() {
                     // request came from the page, not the user, and a toast
                     // the user did not ask for is a notification any site
                     // could trigger at will.
-                    let _ = app.new_tab(&url, false); // background tab: do not switch
+                    let _ = app.open_page_tab(opener, &url, front);
                 }
             }
             Event::UserEvent(UserEvent::DownloadStarted(url)) => {

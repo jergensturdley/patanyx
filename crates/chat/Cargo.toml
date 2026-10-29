@@ -37,8 +37,12 @@ hmac = "0.12"
 # unconditional: wire.rs's registration helpers use it and the relay SERVER
 # crate compiles them.
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
-webpki-roots = { version = "1", optional = true }
+# Security floors: rustls 0.23.46 (RUSTSEC-2026-0346..0349); webpki-roots
+# 1.0.10 drops emSign ECC Root CA - G3 (RUSTSEC-2026-0381). The distrust of the
+# eMudhra intermediates lives in rustls-webpki 0.103.16, pinned in Cargo.lock
+# and enforced by scripts/check-tls-floor.py.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+webpki-roots = { version = "1.0.10", optional = true }
 # Pure Rust, no system daemon, works on Windows as well as Linux.
 mdns-sd = "0.20"
 # mdns-sd hands back a flume Receiver; its RecvTimeoutError has to be nameable

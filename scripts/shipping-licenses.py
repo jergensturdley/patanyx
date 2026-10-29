@@ -74,7 +74,25 @@ CONFIGS = [
 # files sat right there in the crate source -- an attribution file confidently
 # announcing a gap that did not exist.
 LICENCE_FILE_PREFIXES = ("license", "licence", "copying", "unlicense", "notice")
-COPYRIGHT_RE = re.compile(r"^\s*(copyright|\(c\)|©)\s*.+", re.IGNORECASE)
+# A holder line, not licence prose that happens to wrap onto a line starting
+# with "copyright" or "(c)": Apache's "copyright notice that is included...",
+# "copyright license to reproduce..." and "(c) You must retain...", and ISC's
+# "copyright notice and this permission notice appear in all copies." were
+# lifted out of the terms, so the texts shown were not word for word.
+COPYRIGHT_RE = re.compile(
+    r"^\s*(?:copyright\b(?!\s+(?:notice|notices|license|licenses|licence|licences|holder|holders"
+    r"|owner|owners|statement|statements|and|or|law|laws|protection)\b)(?!\s*:\s*$)"
+    r"|\(c\)\s*(?!you\b|under\b)\w|©)\s*.+",
+    re.IGNORECASE,
+)
+# The Apache appendix's template line ("Copyright [yyyy] [name of copyright
+# owner]", also written with braces) names nobody: it is part of the licence
+# text, never a holder, and it stays in the text.
+PLACEHOLDER_RE = re.compile(r"[\[{]\s*(?:yyyy|name of copyright owner)\s*[\]}]", re.IGNORECASE)
+
+
+def is_holder_line(line):
+    return bool(COPYRIGHT_RE.match(line)) and not PLACEHOLDER_RE.search(line)
 
 
 def sh(args):
@@ -161,19 +179,17 @@ def licence_texts(manifest_path):
 def copyright_lines(text):
     out = []
     for line in text.splitlines():
-        if COPYRIGHT_RE.match(line):
+        if is_holder_line(line):
             cleaned = line.strip()
-            # Apache's boilerplate carries a placeholder rather than a holder.
-            if "[yyyy]" in cleaned or "[name of copyright owner]" in cleaned:
-                continue
             if cleaned not in out:
                 out.append(cleaned)
     return out
 
 
 def body_without_copyright(text):
-    """The shareable part: the licence terms with holder lines removed."""
-    kept = [ln for ln in text.splitlines() if not COPYRIGHT_RE.match(ln)]
+    """The shareable part: the licence terms with holder lines removed.
+    Everything else, the Apache template line included, stays word for word."""
+    kept = [ln for ln in text.splitlines() if not is_holder_line(ln)]
     return "\n".join(kept).strip()
 
 
@@ -334,5 +350,67 @@ def main():
         )
 
 
+def self_test():
+    """The holder/prose split, against fixtures whose answers are written
+    here rather than produced by the code under test. Each prose line below
+    was misread as a holder by the generator before 1.0.8."""
+    holders = [
+        "Copyright (c) 2016 Example Author <author@example.com>",
+        "Copyright 2015-2016 Brian Smith.",
+        "  Copyright (C) 2020 The rustls developers",
+        "(c) 2019 The Rust Project Developers",
+        "(C) Example Org",
+        "© 2023 Example Ltd",
+        "Copyright [2021-2022] [Example Author]",
+    ]
+    # Licence text that must stay in the text and never be listed: wrapped
+    # prose, a bare heading (libm's licence), and the Apache template line in
+    # both the bracket and the brace spelling crates ship.
+    prose = [
+        "copyright notice that is included in or attached to the work",
+        "copyright license to reproduce, prepare Derivative Works of,",
+        "(c) You must retain, in the Source form of any Derivative Works",
+        "copyright notice and this permission notice appear in all copies.",
+        "Copyright and related rights are waived",
+        "(c) under the terms of this License",
+        "  copyright:",
+        "Copyright [yyyy] [name of copyright owner]",
+        "   Copyright {yyyy} {name of copyright owner}",
+    ]
+    text = "\n".join(["TERMS", *holders, *prose, "END"])
+
+    def check():
+        listed = copyright_lines(text)
+        body = body_without_copyright(text)
+        problems = []
+        for line in holders:
+            if line.strip() not in listed:
+                problems.append(f"holder not listed: {line.strip()!r}")
+            if line.strip() in body:
+                problems.append(f"holder left in the licence text: {line.strip()!r}")
+        for line in prose:
+            if line.strip() in listed:
+                problems.append(f"licence text listed as a holder: {line.strip()!r}")
+            if line not in body:
+                problems.append(f"licence text dropped from the text: {line.strip()!r}")
+        if "TERMS" not in body or "END" not in body:
+            problems.append("ordinary licence text was dropped")
+        return problems
+
+    global COPYRIGHT_RE
+    problems = check()
+    assert not problems, "\n".join(problems)
+
+    # The fixture must tell the two parsers apart, or it proves nothing.
+    current = COPYRIGHT_RE
+    COPYRIGHT_RE = re.compile(r"^\s*(copyright|\(c\)|©)\s*.+", re.IGNORECASE)
+    try:
+        assert check(), "the pre-1.0.8 parser passed the fixture; it no longer tests the fix"
+    finally:
+        COPYRIGHT_RE = current
+    print("shipping-licenses self-test passed")
+    return 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(self_test() if sys.argv[1:] == ["--self-test"] else main())

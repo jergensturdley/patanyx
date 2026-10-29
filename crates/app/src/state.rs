@@ -1180,6 +1180,12 @@ pub struct Tab {
     /// state machine is pure and lives in `adlist_consent`; this is where it
     /// is kept and the engines reach it.
     adlist: crate::adlist_consent::AdlistConsent,
+    /// Windows: the page request this tab was built to receive (a form posted
+    /// into a new tab, a `window.open`), held by the engine until the first
+    /// page is released (`finish_initial_navigation`). Dropping it answers the
+    /// page with no window, so a tab that closes, or that the user sends
+    /// somewhere else first, never sends the page's request.
+    adoption: Option<platform::AdoptionTicket>,
 }
 
 impl Tab {
@@ -1206,11 +1212,41 @@ impl Tab {
         if !platform::initial_navigation_ready(&self.view) {
             return false;
         }
+        // A page's held request is handed over only once every registration
+        // the first document needs has ANSWERED: WebView2 applies scripts to a
+        // handed-over webview only when they completed before the hand-over.
+        // The overdue release above is not an answer; it retires the
+        // adoption first (`AppState::on_local_network_guard_overdue`).
+        if self.adoption.is_some() && !platform::handover_guarded(&self.view) {
+            self.adoption = None;
+        }
+        if self.adoption.is_some() && !platform::adoption_ready(&self.view) {
+            return false;
+        }
         self.initial_navigation_pending = false;
         if self.close_after_session_wipe {
             return false;
         }
+        // Same mark as the browser's own first page, as before this path
+        // existed: the verdict on a local address was taken when the page
+        // asked, and only an allowed request is held.
         platform::note_app_navigation(&self.view, &self.url);
+        if let Some(ticket) = self.adoption.take() {
+            if platform::release_adoption(&self.webview, &self.view, ticket) {
+                return false;
+            }
+            // Not handed over (the engine refused the hand-over, or the
+            // opener is gone): the page was answered with no window, and this
+            // tab -- built with the child's policy in the opener's profile --
+            // loads the address itself, as every page-opened tab used to.
+        }
+        // A tab built to receive a page's request has no request filter until
+        // here; on every other tab this does nothing. A kept tab whose filter
+        // did not register loads nothing and is being closed.
+        if !platform::attach_deferred_interception(&self.webview, &self.view) {
+            platform::forget_app_navigation(&self.view);
+            return true;
+        }
         if let Err(error) = platform::load_initial_url(&self.webview, self.id, &self.url) {
             // No navigation started, so nothing may inherit the mark
             // (final review 6, R-004).
@@ -1267,10 +1303,26 @@ impl Tab {
         self.block_ads = self.policy.block_ads;
     }
 
+    /// The user sent this tab somewhere before a page's held request was
+    /// handed to it: the request is retired (the page gets no window), and
+    /// the tab no longer holds the page's address either, so nothing of the
+    /// page's request is sent whichever way the user's address goes -- here,
+    /// or to a tab of the other profile that replaces this blank one (code
+    /// review, R-002).
+    fn retire_adoption(&mut self) {
+        if self.adoption.take().is_some() {
+            self.url.clear();
+            self.url.push_str("about:blank");
+        }
+    }
+
     fn queue_or_navigate(&mut self, url: &str) -> Result<(), &'static str> {
         if self.initial_navigation_pending {
             self.url.clear();
             self.url.push_str(url);
+            // The user's address replaces a page's held request: the page is
+            // answered with no window, and its request is never sent.
+            self.adoption = None;
             return Ok(());
         }
         self.load_url(url).map_err(|_| "io")
@@ -1833,7 +1885,7 @@ fn build_tab(
     // boundary at all, so it is never used: it is dropped before its first
     // page is issued and the tab is built in the ordinary profile instead
     // (code review round 2, R-035).
-    let tab = build_tab_as(hosts, proxy, id, url, policy, permissions.clone(), true)?;
+    let tab = build_tab_as(hosts, proxy, id, url, policy, permissions.clone(), true, None)?;
     if tab.profile == crate::kept_profile::ProfileKind::Kept && !platform::kept_boundary_ready(&tab.view) {
         // Not dropped: its controller may be running the kept profile's
         // start-up cleanup, whose completion releases every other kept
@@ -1843,11 +1895,40 @@ fn build_tab(
         // ledger cannot be written: otherwise the ordinary tab built
         // instead would send its page straight back (code review round 5).
         platform::set_kept_enabled(false);
-        return build_tab_as(hosts, proxy, id, url, policy, permissions, false);
+        return build_tab_as(hosts, proxy, id, url, policy, permissions, false, None);
     }
     Ok(tab)
 }
 
+/// Builds the tab that receives a page's held new-window request (Windows,
+/// new_window.rs): in `profile`, which is the opener's, and on the opener's
+/// own engine environment, both of which the engine requires of a webview it
+/// hands a page's request to. The tab is built blank with its request filter
+/// NOT yet attached; `Tab::finish_initial_navigation` hands the request over
+/// and attaches the filter, in the order WebView2 requires, once every
+/// registration the first document needs has answered.
+///
+/// The kept-boundary check `build_tab` makes is made there too, for the same
+/// reason it moved: the filter it checks does not exist until then.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn build_adopting_tab(
+    hosts: &platform::Hosts,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+    url: &str,
+    policy: &platform::TabPolicy,
+    permissions: crate::state::PermissionBook,
+    profile: crate::kept_profile::ProfileKind,
+    opener: &WebView,
+    ticket: platform::AdoptionTicket,
+) -> Result<Tab, wry::Error> {
+    let mut tab = build_tab_as(hosts, proxy, id, url, policy, permissions, true, Some((profile, opener)))?;
+    tab.adoption = Some(ticket);
+    Ok(tab)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_tab_as(
     hosts: &platform::Hosts,
     proxy: &EventLoopProxy<UserEvent>,
@@ -1859,6 +1940,9 @@ fn build_tab_as(
     // so it cannot touch AppState while AppState is mutably borrowed.
     permissions: crate::state::PermissionBook,
     allow_kept: bool,
+    // Windows only: the profile and the opener of a tab built to receive a
+    // page's held new-window request (`build_adopting_tab`).
+    adopt: Option<(crate::kept_profile::ProfileKind, &WebView)>,
 ) -> Result<Tab, wry::Error> {
     let nav_proxy = proxy.clone();
     // Hosts this tab may visit despite the blocklist, because the user chose
@@ -1872,6 +1956,7 @@ fn build_tab_as(
     let nav_insecure_allowed = insecure_override.clone();
     let load_proxy = proxy.clone();
     let title_proxy = proxy.clone();
+    #[cfg(not(windows))]
     let new_window_proxy = proxy.clone();
     // A page's request for a new tab is judged by the document that asked, IN
     // the callback that queues it: nothing is recorded to be paired up later,
@@ -1879,6 +1964,7 @@ fn build_tab_as(
     // R-002). Filled once the platform view exists; before that there is no
     // page that could be asking.
     let new_tab_gate: Rc<RefCell<Option<platform::NewTabGate>>> = Rc::new(RefCell::new(None));
+    #[cfg(not(windows))]
     let window_gate = new_tab_gate.clone();
     let download_start_proxy = proxy.clone();
     let download_done_proxy = proxy.clone();
@@ -1895,13 +1981,21 @@ fn build_tab_as(
     // `with_web_context` setter). See platform::new_webview_builder.
     // KEPT SITES (kept_profile.rs): the profile is decided by the page the
     // tab opens on, and only a tab that keeps data can be in the kept one.
-    let profile = crate::kept_profile::kind_for_url(
-        url,
-        &crate::kept_profile::kept_hosts(),
-        policy.ephemeral,
-        allow_kept && platform::kept_profile_supported(),
-    );
-    let builder = platform::new_webview_builder_for(profile)
+    let profile = match adopt {
+        Some((profile, _)) => profile,
+        None => crate::kept_profile::kind_for_url(
+            url,
+            &crate::kept_profile::kept_hosts(),
+            policy.ephemeral,
+            allow_kept && platform::kept_profile_supported(),
+        ),
+    };
+    let builder = platform::new_webview_builder_for(profile);
+    let builder = match adopt {
+        Some((_, opener)) => platform::on_opener_environment(builder, opener),
+        None => builder,
+    };
+    let builder = builder
         // Developer tools, and ONLY on content. Set here rather than in the
         // shared factory so it can never depend on which builder call comes
         // last: the privileged chrome is built from the same factory and sets
@@ -1988,8 +2082,21 @@ fn build_tab_as(
                 }
             }
             true
-        })
-        .with_new_window_req_handler(move |url, _features| {
+        });
+    // A PAGE'S NEW TAB. On Windows this is not wry's to answer: the engine's
+    // NewWindowRequested event is taken natively (platform/windows.rs,
+    // `connect_navigation_events`), which holds the page's own request -- a
+    // form's POST body, the referrer, the opener -- until a tab is built to
+    // receive it. wry's `NewWindowResponse::Create` completes the request the
+    // moment it hands the webview over, before the new tab's request filter
+    // can be attached, and WebView2 only honours a filter attached AFTER the
+    // hand-over. With no handler installed here, wry answers every request
+    // "handled, no window" at once, and the native handler decides.
+    //
+    // WebKitGTK keeps the path below: a background tab loading the address.
+    // A form posted into a new tab arrives there as a plain page load.
+    #[cfg(not(windows))]
+    let builder = builder.with_new_window_req_handler(move |url, _features| {
             // New windows stay denied; allowed targets get a background tab.
             //
             // This MUST be the same predicate the navigation handler uses. It
@@ -2006,10 +2113,16 @@ fn build_tab_as(
             // (`platform::new_tab_allowed`).
             let allowed = platform::new_tab_allowed(window_gate.borrow().as_ref(), &url);
             if is_allowed_content_url(&url) {
-                let _ = new_window_proxy.send_event(UserEvent::OpenInNewTab { url, allowed });
+                let _ = new_window_proxy.send_event(UserEvent::OpenInNewTab {
+                    opener: id,
+                    url,
+                    allowed,
+                    front: false,
+                });
             }
             wry::NewWindowResponse::Deny
-        })
+        });
+    let builder = builder
         // Main-frame only on both engines (WebKitGTK load-changed reports
         // webview.uri(), WebView2 ContentLoading reports the top-level Source),
         // which is why the displayed URL and history are driven from here
@@ -2062,6 +2175,7 @@ fn build_tab_as(
             id,
             permissions.clone(),
             profile,
+            adopt.is_some(),
         )?;
     *new_tab_gate.borrow_mut() = Some(platform::new_tab_gate(&view));
     // The engine zooms on keys this process never sees; this is how the
@@ -2107,6 +2221,7 @@ fn build_tab_as(
         insecure_pending: None,
         insecure_pending_at: None,
         adlist: crate::adlist_consent::AdlistConsent::default(),
+        adoption: None,
     })
 }
 
@@ -3809,6 +3924,16 @@ impl AppState {
     /// ahead, recorded and diagnosed.
     pub fn on_local_network_guard_overdue(&mut self, id: u64) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            // A page's held request is handed over only once every
+            // registration has really answered; the timer releasing the page
+            // anyway is not an answer. So a request still waiting on one is
+            // retired here, BEFORE the timer's release: the page gets no
+            // window and this tab loads the address itself, as any new tab
+            // does when the timer fires (plan review, H2). A request waiting
+            // only on the start-up clear is not the timer's business.
+            if tab.adoption.is_some() && !platform::registrations_answered(&tab.view) {
+                tab.adoption = None;
+            }
             platform::note_local_network_guard_overdue(&tab.view);
             let failed = tab.finish_initial_navigation();
             if failed {
@@ -3863,6 +3988,133 @@ impl AppState {
         }
         self.emit_tabs_changed();
         self.focus_url_bar_for_blank_tab(switch, url);
+        Ok(id)
+    }
+
+    /// The policy a tab a PAGE opened runs under: the opener's privacy preset
+    /// -- Strict, private or ordinary -- on today's browser-wide switches.
+    ///
+    /// Not the opener's current policy, which can carry "Allow ads and
+    /// trackers on this tab": that allowance belongs to the opener, on one
+    /// site, and ends when the opener leaves it; copied into a new tab it
+    /// would be blocking off with nothing to end it (plan review, H1). And
+    /// not the browser-wide policy alone, which put a private tab's popup in
+    /// ordinary storage.
+    ///
+    /// Storage is the STRICTER of the opener's and the browser-wide switch
+    /// ("Open new tabs without a saved profile" covers every new tab, a
+    /// page's included; compliance audit 2026-10-22). An opener already gone
+    /// gives no policy and no tab: nothing is left to say what the page's tab
+    /// should keep (code review, R-003).
+    fn page_tab_policy(&self, opener: u64) -> Option<platform::TabPolicy> {
+        let source = self.tabs.iter().find(|tab| tab.id == opener)?;
+        if source.policy.strict {
+            return Some(platform::TabPolicy::quarantine());
+        }
+        Some(
+            platform::TabPolicy {
+                ephemeral: source.ephemeral || self.privacy.ephemeral,
+                ..platform::TabPolicy::default()
+            }
+            .rebased_on(&self.privacy),
+        )
+    }
+
+    /// A tab a page opened that loads its address itself: WebKitGTK's only
+    /// path, and Windows' when the page's request cannot be handed over
+    /// (`adopt_new_window`). A background tab, as the page's tabs always
+    /// were, under the opener's preset (`page_tab_policy`).
+    pub fn open_page_tab(&mut self, opener: u64, url: &str, front: bool) -> Result<u64, &'static str> {
+        let policy = self.page_tab_policy(opener).ok_or("opener_gone")?;
+        let built = build_tab(
+            &self.hosts,
+            &self.proxy,
+            self.next_tab_id,
+            url,
+            &policy,
+            self.permissions.clone(),
+        );
+        self.push_page_tab(built, url, front)
+    }
+
+    /// Windows: builds the tab that receives a page's held request
+    /// (`UserEvent::AdoptNewWindow`, new_window.rs). Every refusal drops the
+    /// ticket, which answers the page with no window.
+    ///
+    /// The same checks as every page-opened tab: the address passes
+    /// `is_allowed_content_url` and the tab count stays under MAX_TABS. The
+    /// local-address verdict was taken in the engine event; only an allowed
+    /// request is held.
+    ///
+    /// The engine hands a request only to a webview in the opener's profile.
+    /// A target whose storage differs from the opener's -- a kept site opened
+    /// from an ordinary one, or the reverse -- therefore loads its address in
+    /// a tab of its own profile, as before, and the kept-storage boundary is
+    /// never crossed with a request body (plan review, H4).
+    #[cfg(windows)]
+    pub fn adopt_new_window(&mut self, opener: u64, url: &str, token: u64, front: bool) {
+        let ticket = platform::adoption_ticket(token);
+        if !is_allowed_content_url(url) || self.tabs.len() >= MAX_TABS {
+            return;
+        }
+        let Some(source) = self.tabs.iter().find(|tab| tab.id == opener) else {
+            return;
+        };
+        let Some(policy) = self.page_tab_policy(opener) else {
+            return;
+        };
+        let profile = crate::kept_profile::kind_for_url(
+            url,
+            &crate::kept_profile::kept_hosts(),
+            policy.ephemeral,
+            platform::kept_profile_supported(),
+        );
+        // An in-private tab is a different engine profile from a saved one:
+        // when the browser-wide switch makes the page's tab private and the
+        // opener is not, the request cannot be handed over either.
+        if profile != source.profile || policy.ephemeral != source.ephemeral {
+            drop(ticket);
+            let _ = self.open_page_tab(opener, url, front);
+            return;
+        }
+        let built = build_adopting_tab(
+            &self.hosts,
+            &self.proxy,
+            self.next_tab_id,
+            url,
+            &policy,
+            self.permissions.clone(),
+            profile,
+            &source.webview,
+            ticket,
+        );
+        let _ = self.push_page_tab(built, url, front);
+    }
+
+    /// Adds a tab a page opened. In front only when the user's click or key
+    /// opened it (`front`, Windows: the engine's IsUserInitiated), as in every
+    /// browser: a payment or sign-in window the page waits on has to be
+    /// seen, and one left behind the page stalls it ("Don't see the secure
+    /// PayPal browser?", measured on 1022 build). A page opening one by
+    /// itself gets the background. Either way its first load is the page's,
+    /// not the user's, so the duplicate-site notice does not answer to it.
+    fn push_page_tab(&mut self, built: Result<Tab, wry::Error>, url: &str, front: bool) -> Result<u64, &'static str> {
+        let tab = built.map_err(|_| "tab_failed")?;
+        let id = tab.id;
+        // As in `new_tab`: the id is consumed only once the tab exists.
+        self.next_tab_id += 1;
+        let was_empty = self.tabs.is_empty();
+        self.tabs.push(tab);
+        if was_empty {
+            self.active = 0;
+            self.show_and_focus_tab(0);
+            self.relayout();
+        } else if front {
+            let index = self.tabs.len() - 1;
+            self.set_active(index);
+        }
+        self.emit_tabs_changed();
+        self.focus_url_bar_for_blank_tab(front, url);
         Ok(id)
     }
 
@@ -8058,6 +8310,11 @@ impl AppState {
     // ---- navigation (always the active tab) ----------------------------------
 
     pub fn navigate(&mut self, url: &str) -> Result<(), &'static str> {
+        // A page's request still held for this tab is retired before anything
+        // else: the user's address wins, whichever profile it belongs in.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.retire_adoption();
+        }
         // KEPT SITES (kept_profile.rs): a page that belongs in the other
         // profile opens in a tab of that profile, next to this one, instead
         // of loading here; a blank tab is replaced.
@@ -9634,6 +9891,209 @@ mod tests {
                  vault content",
             );
         }
+    }
+
+    // ---- A page's new tab keeps the page's request (Windows), pinned ------
+    //
+    // The engine glue cannot run in a unit test, so the order WebView2
+    // requires of `put_NewWindow`, and the rules that keep a held request
+    // from ever being sent somewhere it should not, are pinned where they are
+    // written. The table itself is tested in new_window.rs.
+
+    /// wry answers new windows on Windows only through its built-in
+    /// "handled, no window": the native handler is the one decision point.
+    #[test]
+    fn windows_gives_wry_no_new_window_callback() {
+        let build = body_of(STATE, "fn build_tab_as(");
+        let handler = build
+            .find(".with_new_window_req_handler(")
+            .expect("the WebKitGTK new-window path is still installed");
+        assert!(
+            build[..handler].ends_with("#[cfg(not(windows))]\n    let builder = builder"),
+            "wry's new-window callback is installed on Windows again"
+        );
+    }
+
+    /// In the engine event: handled first, the local-address verdict taken
+    /// and the address checked BEFORE the request is held, and nothing built
+    /// there (the tab is built from the message loop).
+    #[test]
+    fn windows_judges_a_new_window_in_the_event_before_holding_it() {
+        let nav = body_of(WINDOWS, "fn connect_navigation_events(");
+        let event = &nav[nav.find("core.add_NewWindowRequested(").expect("handler moved")..];
+        assert!(before(event, "args.SetHandled(true)", "args.GetDeferral()"));
+        assert!(before(event, ".take_new_window_verdict(&url)", "args.GetDeferral()"));
+        assert!(before(event, "crate::state::is_allowed_content_url(&url)", "args.GetDeferral()"));
+        assert!(before(event, "args.GetDeferral()", "hold_new_window("));
+        // Only an HTTPS page in the ordinary profile hands its request over;
+        // every other page's tab loads the address (code review round 2,
+        // R-003, R-004).
+        assert!(before(
+            event,
+            "if !clean || !window_state.borrow().may_hand_over() || !engine_sends_gpc_itself() {",
+            "args.GetDeferral()"
+        ));
+        // Only an engine measured to send GPC itself, read, never assumed.
+        let gpc = body_of(WINDOWS, "fn engine_sends_gpc_itself()");
+        assert!(gpc.contains("crate::platform::RunningVersion::Known(found)"));
+        assert!(!gpc.contains("Unknown"), "an unread engine version must not hand over");
+        let hand = body_of(include_str!("platform/privacy.rs"), "pub fn may_hand_over(&self)");
+        assert!(hand.contains("self.profile == crate::kept_profile::ProfileKind::Main"));
+        assert!(hand.contains("!standing.insecure"));
+        // A re-issue for the filter that fails sends nothing (round 2, R-001),
+        // whether or not a tracking parameter was stripped on the way (round
+        // 3, R-002): `replay` is decided before the strip.
+        assert!(nav.contains("Err(error) if replay => {"));
+        let starting_body = &nav[nav.find("let hop = privacy::handover_hop(").expect("hop moved")..];
+        assert!(before(starting_body, "let replay = hop == privacy::HandoverHop::Replay;", "crate::ipc::navigation_strip_target(&uri)"));
+        // A body-bearing hop the filter will not see is judged here, by the
+        // filter's own decision (round 3, R-001), and an ad-list refusal
+        // raises the held-page banner (round 4, R-002). The rules themselves
+        // are tested in privacy.rs (handover_tests).
+        assert!(before(
+            starting_body,
+            "if hop == privacy::HandoverHop::Judge {",
+            "navigating.Navigate(target)"
+        ));
+        assert!(before(starting_body, "let _ = args.SetCancel(true);", "UserEvent::AdlistBlocked {"));
+        // A listed destination is never handed over (round 4, R-001).
+        assert!(before(event, "privacy::handover_destination_clean(", "args.GetDeferral()"));
+        assert!(starting_body.contains("st.decide_intercepted(\n                                    Some(&uri),\n                                    true,"));
+        // The engine's own GPC covers what the filter cannot see.
+        assert!(WINDOWS.contains("\" --enable-features=GlobalPrivacyControlForce\","));
+        assert_eq!(WINDOWS.matches("--enable-features=").count(), 1, "a second --enable-features cancels the first");
+        // The handed-over first request is never shown to the request filter
+        // (WebView2Feedback #5293): it is marked here and re-issued, when it
+        // has no body, in NavigationStarting.
+        let release = body_of(WINDOWS, "pub fn release_adoption(");
+        assert!(before(release, "first_hop_unfiltered = true;", "held.complete()"));
+        let starting = &nav[nav.find("core.add_NavigationStarting(").expect("moved")..];
+        assert!(before(
+            starting,
+            "let unfiltered_first = starting_state.borrow().first_hop_unfiltered && {",
+            "navigating.Navigate(target)"
+        ));
+        assert!(before(
+            starting,
+            "starting_state.borrow_mut().first_hop_unfiltered = false;",
+            "navigating.Navigate(target)"
+        ));
+        // Every hop of that first navigation, redirects included, until one
+        // is re-issued or the navigation completes.
+        let completed = &nav[nav.find("core.add_NavigationCompleted(").expect("moved")..];
+        assert!(completed.contains("state.borrow_mut().first_hop_unfiltered = false;"));
+        assert!(starting.contains("(!body_bearing)\n                                    .then(|| {"));
+        let hold = body_of(WINDOWS, "fn hold_new_window(");
+        assert!(hold.contains("UserEvent::AdoptNewWindow"));
+        assert!(!hold.contains("build_"), "a tab must not be built inside the engine event");
+    }
+
+    /// The hand-over in WebView2's order: SetNewWindow, THEN the request
+    /// filter, THEN the deferral completes. A kept tab whose filter did not
+    /// register is shut before the request is let go.
+    #[test]
+    fn windows_hands_over_before_the_filter_and_completes_last() {
+        let release = body_of(WINDOWS, "pub fn release_adoption(");
+        assert!(before(release, "held.args.SetNewWindow(&core)", "if !attach_deferred_interception(webview, view)"));
+        assert!(before(release, "if !attach_deferred_interception(webview, view)", "held.complete()"));
+        let shut = &release[release.find("if !attach_deferred_interception(").expect("attach moved")..];
+        assert!(shut.contains("drop(held)"), "a refused kept tab must still answer the page");
+        // The kept boundary is checked wherever the deferred filter is
+        // attached, so every path through it holds (code review, R-001).
+        let attach = body_of(WINDOWS, "pub fn attach_deferred_interception(");
+        assert!(before(attach, "connect_request_interception(", "!kept_boundary_ready(view)"));
+        // Shut at once, before the request is let go or anything can load
+        // (code review round 2, R-002).
+        assert!(before(attach, "webview.controller().Close()", "UserEvent::PageClosedTab(id)"));
+        assert!(attach.contains("UserEvent::PageClosedTab(id)"));
+        let finish = body_of(STATE, "fn finish_initial_navigation(&mut self)");
+        assert!(finish.contains("if !platform::attach_deferred_interception(&self.webview, &self.view) {"));
+        let content = body_of(WINDOWS, "pub fn build_content(");
+        assert!(
+            content.contains("let deferred_interception = if adopting {"),
+            "an adopting tab attaches its filter at build again"
+        );
+    }
+
+    /// Every held request is answered: a dropped entry completes its deferral.
+    #[test]
+    fn windows_answers_every_held_request() {
+        let drop_impl = body_of(WINDOWS, "impl Drop for PendingWindow {");
+        assert!(drop_impl.contains("deferral.Complete()"));
+        let ticket = body_of(WINDOWS, "impl Drop for AdoptionTicket {");
+        assert!(ticket.contains("take_pending_window(self.0)"));
+    }
+
+    /// The first page of a tab holding a request waits for every
+    /// registration's real answer, and the overdue timer retires the request
+    /// before it releases anything.
+    #[test]
+    fn a_held_request_waits_for_answers_and_the_timer_retires_it() {
+        let finish = body_of(STATE, "fn finish_initial_navigation(&mut self)");
+        assert!(before(finish, "platform::adoption_ready(&self.view)", "platform::release_adoption("));
+        // A tab whose NavigationStarting handler did not register never
+        // carries a handed-over request (code review round 5, R-002).
+        assert!(before(finish, "!platform::handover_guarded(&self.view) {\n            self.adoption = None;", "platform::release_adoption("));
+        // One unproven engine report refuses the hand-over for the session,
+        // whatever the merged minimum says (round 5, R-001).
+        let note = body_of(WINDOWS, "fn note_running_environment(");
+        assert!(before(note, "GPC_ENGINE_UNPROVEN.store(true", "RUNNING_ENGINE.lock()"));
+        assert!(body_of(WINDOWS, "fn engine_sends_gpc_itself()").contains("GPC_ENGINE_UNPROVEN.load("));
+        assert!(before(finish, "platform::release_adoption(", "platform::attach_deferred_interception("));
+        assert!(before(finish, "platform::attach_deferred_interception(", "platform::load_initial_url("));
+        let overdue = body_of(STATE, "pub fn on_local_network_guard_overdue(&mut self, id: u64)");
+        assert!(before(overdue, "tab.adoption = None;", "platform::note_local_network_guard_overdue("));
+        let content = body_of(WINDOWS, "pub fn build_content(");
+        assert!(content.contains("if adopting {"), "an adopting tab lost its own overdue timer");
+    }
+
+    /// A typed address replaces a held request; the request is never sent.
+    #[test]
+    fn a_typed_address_retires_a_held_request() {
+        let queue = body_of(STATE, "fn queue_or_navigate(&mut self, url: &str)");
+        assert!(before(queue, "self.url.push_str(url);", "self.adoption = None;"));
+        // Also when the address belongs in the other profile, which never
+        // reaches queue_or_navigate (code review, R-002); and the tab then
+        // holds no address of the page's.
+        let navigate = body_of(STATE, "pub fn navigate(&mut self, url: &str)");
+        assert!(before(navigate, "tab.retire_adoption();", "self.belongs_in_other_profile(tab, url)"));
+        let retire = body_of(STATE, "fn retire_adoption(&mut self)");
+        assert!(retire.contains("self.url.push_str(\"about:blank\");"));
+    }
+
+    /// A page's tab keeps the opener's preset and never its allowance, and a
+    /// request is handed only to a tab in the opener's profile.
+    #[test]
+    fn a_page_tab_keeps_the_preset_not_the_allowance() {
+        let policy = body_of(STATE, "fn page_tab_policy(&self, opener: u64)");
+        assert!(policy.contains("platform::TabPolicy::quarantine()"));
+        // The browser-wide "no saved profile" switch still covers a page's
+        // tab (compliance audit 2026-10-22).
+        assert!(policy.contains("ephemeral: source.ephemeral || self.privacy.ephemeral"));
+        assert!(
+            !policy.contains("source.policy.clone()"),
+            "the opener's current policy (with its allowance) is copied again"
+        );
+        // No opener, no tab: never the browser-wide default (code review,
+        // R-003).
+        assert!(policy.contains("let source = self.tabs.iter().find(|tab| tab.id == opener)?;"));
+        assert!(!policy.contains("None => self.privacy.clone()"));
+        let adopt = body_of(STATE, "pub fn adopt_new_window(&mut self");
+        assert!(before(
+            adopt,
+            "if profile != source.profile || policy.ephemeral != source.ephemeral {",
+            "build_adopting_tab("
+        ));
+        assert!(adopt.contains("self.tabs.len() >= MAX_TABS"));
+        assert!(adopt.contains("is_allowed_content_url(url)"));
+    }
+
+    /// A page closing its own window closes the tab.
+    #[test]
+    fn a_page_closing_itself_closes_the_tab() {
+        let content = body_of(WINDOWS, "pub fn build_content(");
+        assert!(content.contains("connect_page_close(&webview, proxy, id);"));
+        assert!(MAIN.contains("Event::UserEvent(UserEvent::PageClosedTab(id)) => {"));
     }
 }
 

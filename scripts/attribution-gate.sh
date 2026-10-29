@@ -44,6 +44,11 @@ python3 scripts/artifact-manifest-gate.py
 # Checked here so it cannot drift from the shipped registry unnoticed.
 python3 scripts/langpack-provenance-gate.py
 
+# The generator's holder/prose split, against fixed answers: a parser that
+# misreads licence prose regenerates the same wrong output every time, which
+# the diff below cannot see.
+python3 scripts/shipping-licenses.py --self-test
+
 echo "regenerating attribution into a scratch directory..."
 python3 scripts/shipping-licenses.py "$TMP" >/dev/null
 

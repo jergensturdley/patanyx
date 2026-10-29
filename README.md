@@ -120,7 +120,7 @@ cosign verify-blob PATANYX.exe \
   --certificate-oidc-issuer https://accounts.google.com
 ```
 
-Windows binaries are also Authenticode-signed, so Windows will name the publisher in the file's Properties.
+The Windows download on patanyx.net is also Authenticode-signed, so Windows names the publisher in the file's Properties. Not every Windows release is: the 1.0.8 `PATANYX.exe` has no Authenticode signature, so verify it with its Sigstore bundle or its SHA-256.
 
 The browser updates itself from `patanyx.edgexene.io` over its own signed update channel, independently of this repository: each update is described by an Ed25519-signed manifest that the browser verifies against a key compiled into the binary, and nothing installs without your say-so.
 

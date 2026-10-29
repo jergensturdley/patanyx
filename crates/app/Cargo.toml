@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.7"
+version = "1.0.8"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -140,7 +140,11 @@ ureq = { version = "2.12", default-features = false, features = ["tls", "socks-p
 # built here, per agent, via AgentBuilder::tls_config. rustls and webpki-roots
 # are already in the lock through ureq; rustls-native-certs is new and is what
 # reads the OS store (schannel on Windows).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+# Security floors (scripts/check-tls-floor.py enforces them in Cargo.lock):
+# rustls 0.23.46 (RUSTSEC-2026-0346..0349); rustls-webpki 0.103.16 refuses the
+# distrusted emSign intermediates (RUSTSEC-2026-0382); webpki-roots 0.26 is a
+# shim over 1.x, which must resolve to 1.0.10 or newer (RUSTSEC-2026-0381).
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 
@@ -237,6 +241,10 @@ tempfile = "3"
 # The freeze-exception tests match the generated url-filter patterns against
 # real URLs (already in the lockfile through other crates; test-only).
 regex = "1"
+# The TLS distrust tests in net.rs mint a throwaway test CA and leaf. Already
+# in the lockfile beneath rustls; used here only to issue test certificates,
+# which the shipped binary never does.
+ring = "0.17"
 
 # build.rs compiles src/blocklist.txt into sorted hashes; it shares
 # hostrules.rs with the crate and therefore needs the same hasher.

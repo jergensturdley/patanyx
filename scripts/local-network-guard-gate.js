@@ -703,30 +703,46 @@ const PUBLIC_HTTP = {
     !/LOCAL_NETWORK_GUARD_SCRIPT|install_local_network_guard|local_network_guard\.js/.test(unix),
     "Linux never gets it (the rule is Windows-only)",
   );
-  // A page's new tab is judged when the page asked. wry answers from the
-  // message loop, later, so the engine event itself records a refusal
-  // (windows.rs NewWindowRequested -> on_new_window_requested), and wry's
-  // callback spends it for every request before anything else (final review
-  // 6, R-002). Only refusals are recorded, so nothing left over can allow a
-  // request (final review 5, R-002). The sink honours the verdict.
+  // A page's new tab is judged when the page asked.
+  //
+  // Windows: the engine event itself is the only decision point (wry is given
+  // no new-window callback there, so it answers "handled, no window"). It
+  // records the request and takes the verdict in the same moment, and checks
+  // the address, BEFORE a request is held for hand-over or passed on to be
+  // loaded (final review 6, R-002; new-window hand-over 2026-10-22). Only a
+  // registered handler vouches for anything.
+  //
+  // WebKitGTK: wry answers from the message loop, and its callback spends the
+  // verdict before queueing the request. Only refusals are recorded, so
+  // nothing left over can allow a request (final review 5, R-002). The sink
+  // honours the verdict on both paths.
   const stateRs = read("crates/app/src/state.rs");
   const queue = stateRs.slice(stateRs.indexOf(".with_new_window_req_handler("));
   const queueBody = queue.slice(0, queue.indexOf("wry::NewWindowResponse::Deny"));
   check(
-    /let allowed = platform::new_tab_allowed\(window_gate\.borrow\(\)\.as_ref\(\), &url\);\s*if is_allowed_content_url\(&url\) \{\s*let _ = new_window_proxy\.send_event\(UserEvent::OpenInNewTab \{ url, allowed \}\);/.test(queueBody),
-    "the new-tab verdict is taken in the callback that queues the request",
+    /#\[cfg\(not\(windows\)\)\]\s*let builder = builder\.with_new_window_req_handler\(/.test(stateRs) &&
+      /let allowed = platform::new_tab_allowed\(window_gate\.borrow\(\)\.as_ref\(\), &url\);\s*if is_allowed_content_url\(&url\) \{\s*let _ = new_window_proxy\.send_event\(UserEvent::OpenInNewTab \{\s*opener: id,\s*url,\s*allowed,\s*front: false,\s*\}\);/.test(queueBody),
+    "WebKitGTK: the new-tab verdict is taken in the callback that queues the request, and wry gets no callback on Windows",
+  );
+  const event = windows.slice(windows.indexOf("core.add_NewWindowRequested("));
+  const eventBody = event.slice(0, event.indexOf("Ok(()) => state.borrow_mut().new_window_tracking = true") + 60);
+  check(
+    /st\.on_new_window_requested\(Some\(&url\)\);\s*st\.take_new_window_verdict\(&url\)/.test(eventBody) &&
+      /Ok\(\(\)\) => state\.borrow_mut\(\)\.new_window_tracking = true/.test(eventBody),
+    "Windows: the refusal is recorded and spent in the engine event itself, and only a registered handler vouches for anything",
+  );
+  const judged = eventBody.indexOf("if !allowed || !crate::state::is_allowed_content_url(&url) {");
+  check(
+    judged > 0 &&
+      judged < eventBody.indexOf("UserEvent::OpenInNewTab {") &&
+      judged < eventBody.indexOf("args.GetDeferral()") &&
+      judged < eventBody.indexOf("hold_new_window("),
+    "Windows: a refused request is neither held nor passed on",
   );
   check(
-    /add_NewWindowRequested\([\s\S]{0,900}on_new_window_requested\(url\.as_deref\(\)\)[\s\S]{0,400}Ok\(\(\)\) => state\.borrow_mut\(\)\.new_window_tracking = true/.test(windows),
-    "the refusal is recorded in the engine event itself, and only a registered handler vouches for anything",
-  );
-  check(
-    /gate\.0\.borrow_mut\(\)\.take_new_window_verdict\(url\)/.test(windows),
-    "wry's callback spends the refusal the event recorded",
-  );
-  check(
-    /UserEvent::OpenInNewTab \{ url, allowed \}\) => \{/.test(main) &&
-      /if allowed && state::is_allowed_content_url\(&url\)/.test(main),
+    /UserEvent::OpenInNewTab \{ opener, url, allowed, front \}\) => \{/.test(main) &&
+      /if allowed && state::is_allowed_content_url\(&url\)/.test(main) &&
+      /pub fn adopt_new_window\([\s\S]{0,1500}if !is_allowed_content_url\(url\) \|\| self\.tabs\.len\(\) >= MAX_TABS/.test(stateRs),
     "the tab factory honours that verdict",
   );
   // The first page waits for the guard's answer, and an answer that never
@@ -735,7 +751,7 @@ const PUBLIC_HTTP = {
   check(
     /\} else \{[\s\S]{0,300}std::thread::sleep\(LOCAL_NETWORK_GUARD_ANSWER_WAIT\);\s*let _ = overdue_proxy\.send_event\(UserEvent::LocalNetworkGuardOverdue\(id\)\);/.test(windows) &&
       /UserEvent::LocalNetworkGuardOverdue\(id\)\) => \{\s*app\.on_local_network_guard_overdue\(id\)/.test(main) &&
-      /fn on_local_network_guard_overdue\(&mut self, id: u64\) \{[\s\S]{0,200}platform::note_local_network_guard_overdue\(&tab\.view\);\s*(?:let failed = )?tab\.finish_initial_navigation\(\);/.test(stateRs),
+      /fn on_local_network_guard_overdue\(&mut self, id: u64\) \{[\s\S]{0,1200}platform::note_local_network_guard_overdue\(&tab\.view\);\s*(?:let failed = )?tab\.finish_initial_navigation\(\);/.test(stateRs),
     "an unanswered guard releases the first page after a bounded wait",
   );
   check(

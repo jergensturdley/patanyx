@@ -1,7 +1,13 @@
 # Authenticode signing, and why it is not optional
 
-Every PATANYX binary is currently **unsigned**. The certificate table in the PE
-header is empty, checked rather than assumed.
+Now: Windows releases are Authenticode-signed through Azure Artifact Signing,
+except 1.0.8, a maintenance release published without the signature (installed
+copies verify their Ed25519-signed update manifest, never Authenticode). The
+text below was written while every binary was unsigned; its reasoning about
+downloads still holds.
+
+At the time, every PATANYX binary was **unsigned**. The certificate table in the
+PE header was empty, checked rather than assumed.
 
 That is a distribution problem, not a cosmetic one. SmartScreen attaches
 reputation to a specific file hash and a publisher identity. With no publisher
