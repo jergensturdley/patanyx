@@ -16,6 +16,7 @@
 //! edition.
 
 use std::cell::{Cell, RefCell};
+use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -27,7 +28,7 @@ use objc2_app_kit::{
     NSAppearance, NSApplication, NSBitmapImageFileType, NSBitmapImageRep, NSImage, NSOpenPanel,
     NSPasteboard, NSSavePanel, NSView, NSWindowOrderingMode,
 };
-use objc2_foundation::{ns_string, NSDate, NSDictionary, NSProcessInfo, NSSet, NSString};
+use objc2_foundation::{NSArray, NSDate, NSDictionary, NSProcessInfo, NSString, NSURL};
 use objc2_web_kit::{WKContentRuleList, WKContentRuleListStore, WKUserScript};
 use tao::event_loop::EventLoopProxy;
 use tao::window::Window;
@@ -242,7 +243,14 @@ pub fn build_content(
     // `new_webview_builder_for`); recorded on the tab's state so the panel
     // and `finish_session_wipe` see Main everywhere.
     profile: crate::kept_profile::ProfileKind,
+    // Windows only: a page's new tab is never held on this backend (the
+    // adoption stubs below); a page's new tab loads its address.
+    _adopting: bool,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
+    // The wake every filter completion sends its settled events through, set
+    // before anything can compile, so a caller that builds a tab outside the
+    // app shell (the translate probe) has its own loop reached too.
+    OVERLAP_WAKE.with(|w| *w.borrow_mut() = Some(proxy.clone()));
     // Blank build, navigate after every script and filter is registered —
     // applying the URL on the builder starts WebKit loading during the build,
     // which races document-start registration and loses the first page's
@@ -347,11 +355,15 @@ pub fn build_content(
     // process and hold this tab's first navigation behind the async
     // completion. Ephemeral tabs use an ephemeral store — nothing to clear.
     ITP_CONFIRMED.store(true, Ordering::Relaxed);
-    let initial_navigation_pending = if policy.ephemeral {
+    // The first page waits for the start-up clear AND for this tab's bundled
+    // rule lists to land: the lists compile asynchronously, and a page issued
+    // meanwhile sent its requests with no filters in place (unix's gate).
+    let waiting_for_wipe = if policy.ephemeral {
         false
     } else {
         begin_new_session_wipe(proxy)
     };
+    let initial_navigation_pending = waiting_for_wipe || !initial_navigation_ready(&view);
     if !initial_navigation_pending {
         super::load_initial_url(&webview, id, url)?;
     }
@@ -482,14 +494,7 @@ enum BundledFilter {
 }
 
 impl BundledFilter {
-    fn id(self) -> &'static str {
-        match self {
-            BundledFilter::Ads => privacy::bundled_ads_filter_id(),
-            BundledFilter::Tracking => privacy::bundled_tracking_filter_id(),
-        }
-    }
-
-    fn json(self) -> String {
+    fn json(&self) -> String {
         match self {
             BundledFilter::Ads => privacy::content_blocker_json(privacy::bundled_ads()),
             BundledFilter::Tracking => privacy::content_blocker_json(privacy::bundled_tracking()),
@@ -502,77 +507,151 @@ fn rule_list_store() -> Option<Retained<WKContentRuleListStore>> {
     unsafe { WKContentRuleListStore::defaultStore(main_thread_marker()) }
 }
 
-/// Compiles `json` into a content rule list and adds it to `cc`.
-///
-/// Degrades rather than crashing: any failure leaves the controller without
-/// this filter — visible as ads not being blocked, never as a panic mid
-/// session. `freeze_state`, when present, is marked `Failed` on every path
-/// that does not reach the engine, so a freeze that failed to compile cannot
-/// keep the UI saying "Frozen, making no requests".
-fn compile_and_add(
+// The compiled rule lists this run made, by the id each compiles under.
+// Keeping the objects in memory is what makes a rebuild synchronous: the
+// controller gets the SAME object back with `addContentRuleList`, with no
+// store round-trip in between. Between `removeAllContentRuleLists` and an
+// async re-add, a tab would briefly block nothing at all, and the reload a
+// switch issues could outrun its own lists.
+thread_local! {
+    static COMPILED_RULE_LISTS:
+        RefCell<std::collections::HashMap<String, Retained<WKContentRuleList>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Remembers a compiled list under its id. A list is content-addressed
+/// (`filter_id_for`), so remembering a compile the tab then declined costs
+/// nothing: a later rebuild that wants it adds it from here.
+fn remember_rule_list(id: &str, list: &Retained<WKContentRuleList>) {
+    COMPILED_RULE_LISTS.with(|c| {
+        c.borrow_mut().insert(id.to_string(), list.clone());
+    });
+}
+
+/// The run's in-memory copy of the list `id`, when there is one.
+fn cached_rule_list(id: &str) -> Option<Retained<WKContentRuleList>> {
+    COMPILED_RULE_LISTS.with(|c| c.borrow().get(id).cloned())
+}
+
+fn forget_rule_list(id: &str) {
+    COMPILED_RULE_LISTS.with(|c| {
+        c.borrow_mut().remove(id);
+    });
+}
+
+/// Sends a settled event through the event loop. `OVERLAP_WAKE` is set at
+/// the first build (`build_content`), before anything can compile.
+fn wake(event: UserEvent) {
+    OVERLAP_WAKE.with(|w| {
+        if let Some(proxy) = w.borrow().as_ref() {
+            let _ = proxy.send_event(event);
+        }
+    });
+}
+
+/// One bundled compile started for a tab has ended, however it ended. The
+/// tab's count goes down, and at zero the tab's held first page is looked at
+/// again (`BundledFiltersSettled`). A drop guard, so no return path in the
+/// completion can forget the count.
+struct BundledLoadEnds {
+    state: Option<Rc<RefCell<TabState>>>,
+}
+
+impl Drop for BundledLoadEnds {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let settled = {
+            let mut st = state.borrow_mut();
+            st.bundled_filters_loading = st.bundled_filters_loading.saturating_sub(1);
+            st.bundled_filters_loading == 0
+        };
+        if settled {
+            wake(UserEvent::BundledFiltersSettled);
+        }
+    }
+}
+
+/// Installs both shipped filters. A list this run already compiled goes
+/// straight back on the controller from memory, synchronously; only a run's
+/// first use compiles, and that compile is counted on the tab
+/// (`bundled_filters_loading`) so its first page waits for the lists.
+fn install_bundled_filters(
+    cc: &Retained<objc2_web_kit::WKUserContentController>,
+    view: &TabView,
+) {
+    for json in [BundledFilter::Ads.json(), BundledFilter::Tracking.json()] {
+        let id = privacy::filter_id_for(&json);
+        if let Some(list) = cached_rule_list(&id) {
+            // SAFETY: main-thread controller mutation of a list we hold.
+            unsafe { cc.addContentRuleList(&list) };
+            continue;
+        }
+        compile_bundled_list(cc, &json, &id, view);
+    }
+}
+
+/// The one compile a bundled list needs per run. Counted up before it
+/// starts, counted down when the completion ends, on success and failure
+/// alike. On success the list is remembered, and added only if the tab still
+/// wants it: a compile that finishes after the tab's blocking changed adds
+/// nothing, so a late compile cannot come back over a switched-off policy.
+fn compile_bundled_list(
     cc: &Retained<objc2_web_kit::WKUserContentController>,
     json: &str,
-    freeze_state: Option<Rc<RefCell<TabState>>>,
+    id: &str,
+    view: &TabView,
 ) {
     let Some(store) = rule_list_store() else {
-        if let Some(state) = &freeze_state {
-            state.borrow_mut().freeze.note_enforcement_failed();
-        }
         diag("content rule list store unavailable");
         return;
     };
-    // The block outlives this frame, so it captures the controller by value.
-    let cc = cc.clone();
-    let id_string = privacy::filter_id_for(json);
-    let id = NSString::from_str(&id_string);
+    view.state.borrow_mut().bundled_filters_loading += 1;
+    let state = view.state.clone();
+    // The guard is dropped INSIDE the block (a block is `Fn`, it may run
+    // more than once only in principle, but it must stay callable): the
+    // RefCell lets the one drop happen through a shared reference.
+    let guard = std::cell::RefCell::new(Some(BundledLoadEnds {
+        state: Some(view.state.clone()),
+    }));
+    let id_ns = NSString::from_str(id);
     let source = NSString::from_str(json);
-    // SAFETY: the block is retained by the callee for the async lifetime; the
-    // captures (controller, state) are Rc, and WebKit raises this callback on
-    // the main thread the webview was built on. Block parameters are
-    // __unsafe_unretained object pointers — retained before use.
+    let id = id.to_string();
+    let cc = cc.clone();
+    // SAFETY: the block is retained by the callee for the async lifetime;
+    // the captured Retained, Rc and guard values live with it. WebKit raises
+    // this callback on the main thread the webview was built on. Block
+    // parameters are __unsafe_unretained object pointers: retained before
+    // use.
     unsafe {
         store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
-            Some(&id),
+            Some(&id_ns),
             Some(&source),
             Some(&block2::RcBlock::new(
                 move |list: *mut WKContentRuleList, error: *mut objc2_foundation::NSError| {
                     if !list.is_null() {
                         let list = Retained::retain(list).expect("rule list pointer");
-                        cc.addContentRuleList(&list);
-                        if let Some(state) = &freeze_state {
-                            state.borrow_mut().freeze.note_enforced();
+                        remember_rule_list(&id, &list);
+                        let lands = state.borrow().wants_ad_filters();
+                        if lands {
+                            cc.addContentRuleList(&list);
                         }
                     } else {
                         let why = (!error.is_null())
                             .then(|| Retained::retain(error).expect("error pointer"))
                             .map(|e| e.localizedDescription().to_string())
                             .unwrap_or_else(|| "unknown error".to_string());
-                        match &freeze_state {
-                            Some(state) => {
-                                state.borrow_mut().freeze.note_enforcement_failed();
-                                diag(&format!("freeze filter not installed: {why}"));
-                            }
-                            None => {
-                                diag(&format!("ad/tracker filter not installed: {why}"));
-                            }
-                        }
+                        diag(&format!("ad/tracker filter not installed: {why}"));
+                    }
+                    // Ends the count; at zero the tab's first page may go.
+                    if let Some(guard) = guard.borrow_mut().take() {
+                        drop(guard);
                     }
                 },
             )),
         );
     }
-}
-
-/// Installs both shipped filters, compile-first. WebKit's store has no
-/// load-first query in the pinned bindings; compilation is cached by
-/// identifier in-process, and the OS-level recompile cost is the price of
-/// first run per session. `ponytail:` no disk cache probe; add when tab
-/// startup measurably pays for it.
-fn install_bundled_filters(cc: &Retained<objc2_web_kit::WKUserContentController>) {
-    let ads = BundledFilter::Ads.json();
-    let tracking = BundledFilter::Tracking.json();
-    compile_and_add(cc, &ads, None);
-    compile_and_add(cc, &tracking, None);
 }
 
 /// Removes every compiled rule list. Filters are managed as a set, so this
@@ -584,22 +663,291 @@ fn remove_all_filters(cc: &objc2_web_kit::WKUserContentController) {
     unsafe { cc.removeAllContentRuleLists() };
 }
 
+/// Puts the tab's INSTALLED freeze filter back on its controller from the
+/// run's memory cache: for paths that removed every filter while the freeze
+/// itself did not change. No request is made of any store, no generation is
+/// quoted, and the Book still holds the filter as installed; the engine
+/// simply gets the same object back. A frozen tab therefore has no moment
+/// with no freeze, even across a rebuild.
+fn reinstall_installed_freeze_filter(
+    cc: &Retained<objc2_web_kit::WKUserContentController>,
+    view: &TabView,
+) {
+    for id in view.state.borrow().freeze_filters.installed_list_ids() {
+        if let Some(list) = cached_rule_list(&id) {
+            // SAFETY: main-thread controller mutation of a list we hold.
+            unsafe { cc.addContentRuleList(&list) };
+        }
+    }
+}
+
+/// Where a freeze filter compiles: a per-run directory (0700) under the
+/// user's temp folder. A freeze filter's rules name every host the user
+/// allowed on the frozen tab, so its compiled copy must not land in the
+/// persistent store, where nothing would ever remove it and the hosts would
+/// outlive the session (the Strict Tabs promise to keep nothing). Without a
+/// usable directory the default store is used and the removal still applies,
+/// and `remove_stale_freeze_stores` clears anything a crash left behind.
+fn freeze_rule_list_store() -> Option<Retained<WKContentRuleListStore>> {
+    let dir = freeze_store_dir()?;
+    let path = NSString::from_str(dir.to_str()?);
+    let url = NSURL::fileURLWithPath_isDirectory(&path, true);
+    // SAFETY: main-thread store construction on a directory this process
+    // just made, 0700.
+    let store = unsafe { WKContentRuleListStore::storeWithURL(Some(&url), main_thread_marker()) };
+    match store {
+        Some(store) => Some(store),
+        None => rule_list_store(),
+    }
+}
+
+/// The per-run freeze store directory: `patanyx-<pid>-freeze` under the
+/// user's temp folder, 0700, also re-tightened when a directory of the same
+/// name was left by an ended run whose pid this run reused.
+fn freeze_store_dir() -> Option<std::path::PathBuf> {
+    let dir = std::env::temp_dir().join(format!("patanyx-{}-freeze", std::process::id()));
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        // This run already made it; a second store request reuses it.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
+}
+
+/// Once per run, before any freeze: a freeze filter means nothing to the
+/// next run, so the per-run store of a run that has ended is deleted. A
+/// directory goes only when its pid is not ours and the kernel says the
+/// process is gone (`process_is_gone`), and only when the entry is a real
+/// directory (`symlink_metadata` does not follow links). The default store
+/// is then swept of every list this run does not itself compile: earlier
+/// builds saved a freeze filter's stored copy there and never removed it.
+fn remove_stale_freeze_stores() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        let me = std::process::id();
+        for entry in entries.flatten() {
+            let Some(pid) = freeze_dir_pid(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            if pid == me || !process_is_gone(pid) {
+                continue;
+            }
+            if !std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+        sweep_default_store_of_foreign_lists();
+    });
+}
+
+/// The per-run store directory name, `patanyx-<pid>-freeze`, parsed.
+fn freeze_dir_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("patanyx-")?
+        .strip_suffix("-freeze")?
+        .parse::<u32>()
+        .ok()
+}
+
+/// `kill(pid, 0)` sends nothing; the kernel answers whether a process the
+/// caller may signal exists, and ESRCH means none does. A process that
+/// exists but may not be signalled (EPERM) counts as alive: deleting the
+/// store of a run we cannot inspect would be the bolder answer, not the
+/// safer one.
+fn process_is_gone(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let answered = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    answered == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Removes every stored list in the default store whose id this run does not
+/// itself compile. Earlier builds kept a freeze filter's stored copy there
+/// forever; the ids of a list naming allowed hosts cannot be picked out by
+/// name, so the sweep keeps only the bundled lists, whose ids are computed
+/// from the same JSON this run installs (an in-flight compile of theirs is
+/// therefore never swept by mistake). A stale overlap entry is only a cache:
+/// its content moves with the shipped lists, and it is recompiled when next
+/// wanted.
+fn sweep_default_store_of_foreign_lists() {
+    let Some(store) = rule_list_store() else {
+        return;
+    };
+    let keep = [
+        privacy::filter_id_for(&BundledFilter::Ads.json()),
+        privacy::filter_id_for(&BundledFilter::Tracking.json()),
+    ];
+    // The block holds its own ref on the store: the removals run after this
+    // frame is gone.
+    let store_for_block = store.clone();
+    // SAFETY: main-thread store read; the block is retained by WebKit.
+    unsafe {
+        store.getAvailableContentRuleListIdentifiers(Some(&block2::RcBlock::new(
+            move |ids: *mut NSArray<NSString>| {
+                let store = &store_for_block;
+                // Already inside this call's unsafe block.
+                let Some(ids) = ids.as_ref() else {
+                    return;
+                };
+                for i in 0..ids.count() {
+                    let id = ids.objectAtIndex(i).to_string();
+                    if !keep.contains(&id) {
+                        remove_stored_rule_list(&store, &id);
+                    }
+                }
+            },
+        )));
+    }
+}
+
+/// Removes the stored copy of `id` from `store`. A list works from the
+/// controller's memory once installed, so the copy is only WebKit's compile
+/// cache; for a freeze filter it is a cache of the hosts the user allowed,
+/// which nothing else would ever remove.
+fn remove_stored_rule_list(store: &Retained<WKContentRuleListStore>, id: &str) {
+    let id_ns = NSString::from_str(id);
+    // SAFETY: main-thread store mutation; the block is retained by WebKit.
+    unsafe {
+        store.removeContentRuleListForIdentifier_completionHandler(
+            Some(&id_ns),
+            Some(&block2::RcBlock::new(|_error: *mut objc2_foundation::NSError| {})),
+        );
+    }
+}
+
 /// Installs the freeze filter for the tab's OWN webview: everything except
-/// the session's allow-override hosts. Clear-first (a previous freeze filter
-/// with wider exceptions must not survive alongside the narrower new one),
-/// then compile-and-add with the state handed to the completion, so the
-/// enforcement ledger only records what WebKit confirmed.
+/// the session's allow-override hosts. A PREVIOUS freeze filter (fewer
+/// exceptions, when one host is being allowed) stays in place until this one
+/// is installed: removing it first left a frozen tab with no freeze while
+/// the replacement compiled. `FreezeFilterBook` swaps them in the completion
+/// and quotes a generation back, so a late compile of a superseded request
+/// installs nothing.
 fn install_freeze_filter(webview: &WebView, view: &TabView) {
-    let Some(cc) = content_controller(webview) else { return };
+    // Once per run, before the first freeze, so nothing a crashed run left
+    // behind outlives it.
+    remove_stale_freeze_stores();
+    let Some(cc) = content_controller(webview) else {
+        return;
+    };
     let exceptions = view.state.borrow().freeze.overrides();
     let json = privacy::freeze_filter_json(&exceptions);
-    remove_all_filters(&cc);
-    compile_and_add(&cc, &json, Some(view.state.clone()));
+    let id = privacy::filter_id_for(&json);
+    let holds_hosts = !exceptions.is_empty();
+    let generation = view
+        .state
+        .borrow_mut()
+        .freeze_filters
+        .request_with_hosts(id.clone(), exceptions);
+    compile_freeze_list(&cc, &json, &id, view.state.clone(), generation, holds_hosts);
+}
+
+/// The freeze compile, into the per-run store. The completion quotes the
+/// generation back through `FreezeFilterBook::on_compiled`: only the freeze
+/// the tab still wants, while it is still frozen, lands. A compile that
+/// finished after an unfreeze, or after a newer freeze was asked for,
+/// installs nothing and reports nothing about the freeze the tab wants now;
+/// a superseded list that named hosts still has its stored copy removed.
+fn compile_freeze_list(
+    cc: &Retained<objc2_web_kit::WKUserContentController>,
+    json: &str,
+    id: &str,
+    state: Rc<RefCell<TabState>>,
+    generation: u64,
+    holds_hosts: bool,
+) {
+    let Some(store) = freeze_rule_list_store() else {
+        state.borrow_mut().freeze.note_enforcement_failed();
+        diag("content rule list store unavailable");
+        return;
+    };
+    let id_ns = NSString::from_str(id);
+    let source = NSString::from_str(json);
+    let id = id.to_string();
+    let cc = cc.clone();
+    // The block holds its own ref on the store: the removal runs on it after
+    // this frame is gone.
+    let store_for_block = store.clone();
+    // SAFETY: as compile_bundled_list.
+    unsafe {
+        store.compileContentRuleListForIdentifier_encodedContentRuleList_completionHandler(
+            Some(&id_ns),
+            Some(&source),
+            Some(&block2::RcBlock::new(
+                move |list: *mut WKContentRuleList, error: *mut objc2_foundation::NSError| {
+                    let store = &store_for_block;
+                    if list.is_null() {
+                        let why = (!error.is_null())
+                            .then(|| Retained::retain(error).expect("error pointer"))
+                            .map(|e| e.localizedDescription().to_string())
+                            .unwrap_or_else(|| "unknown error".to_string());
+                        // A failure for a superseded freeze request says
+                        // nothing about the freeze the tab wants now.
+                        let current = state
+                            .borrow()
+                            .freeze_filters
+                            .failure_is_current(&id, generation);
+                        if current {
+                            state.borrow_mut().freeze.note_enforcement_failed();
+                            diag(&format!("freeze filter not installed: {why}"));
+                        }
+                        return;
+                    }
+                    let list = Retained::retain(list).expect("rule list pointer");
+                    let decision = {
+                        let mut st = state.borrow_mut();
+                        let frozen = st.freeze.phase() == FreezePhase::Frozen;
+                        st.freeze_filters.on_compiled(&id, generation, frozen)
+                    };
+                    if let privacy::CompiledFreeze::Install { remove } = decision {
+                        cc.addContentRuleList(&list);
+                        remember_rule_list(&id, &list);
+                        state.borrow_mut().freeze.note_enforced();
+                        // Superseded freeze filters come off only now that
+                        // the replacement enforces: until this moment the old
+                        // filter was the freeze the tab had.
+                        for old in remove {
+                            if let Some(old_list) = cached_rule_list(&old) {
+                                cc.removeContentRuleList(&old_list);
+                            }
+                            forget_rule_list(&old);
+                        }
+                    }
+                    // The stored copy leaves on every path out of a handled
+                    // freeze compile: the filter works from the controller's
+                    // memory, and a copy on disk names the hosts that were
+                    // allowed when it was asked for.
+                    if holds_hosts {
+                        remove_stored_rule_list(&store, &id);
+                    }
+                },
+            )),
+        );
+    }
 }
 
 /// Whether freezing actually blocks requests on this platform.
 pub fn freeze_enforced() -> bool {
     true
+}
+
+/// The smoke gate's hardware lever, macOS side: drops the STORED copies of
+/// the bundled lists from the default store, after the controllers already
+/// hold the compiled objects. If a stored copy were load-bearing, the smoke
+/// run's blocking probe would see the page's requests escape. Unix does not
+/// drop its store: there it is the backend's compile cache and the smoke has
+/// no equivalent lever, which is fine, the question is about this backend's
+/// persistent store.
+pub fn drop_stored_rule_list_copies() {
+    let Some(store) = rule_list_store() else {
+        return;
+    };
+    for json in [BundledFilter::Ads.json(), BundledFilter::Tracking.json()] {
+        remove_stored_rule_list(&store, &privacy::filter_id_for(&json));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,10 +964,17 @@ pub fn note_app_navigation(_view: &TabView, _url: &str) {}
 /// No-op, as `note_app_navigation`.
 pub fn forget_app_navigation(_view: &TabView) {}
 
-/// Always: nothing but the session wipe holds a first page here, and
-/// AppState already waits for that.
-pub fn initial_navigation_ready(_view: &TabView) -> bool {
-    true
+/// Whether this tab's first page may be issued: its bundled ad and tracker
+/// filters are in (or their loads ended), and the start-up clear its profile
+/// waits on is done. The clear used to be the only hold here and
+/// `SessionWipeFinished` the only release; the bundled compiles hold their
+/// own count now and release through `BundledFiltersSettled`, so both are
+/// asked (unix's shape).
+pub fn initial_navigation_ready(view: &TabView) -> bool {
+    let st = view.state.borrow();
+    st.bundled_filters_loading == 0
+        && (st.policy.ephemeral
+            || super::session_wipe_finished(crate::kept_profile::ProfileKind::Main))
 }
 
 /// No-op: the WebSocket guard is Windows-only, so nothing here is overdue.
@@ -634,9 +989,15 @@ pub fn report_initial_navigation_failure(url: &str, error: &wry::Error) {
 /// No-op: the tab's pending flag is the whole wipe state here.
 pub fn note_session_wipe_finished(_view: &TabView) {}
 
-/// A pending first page here means the tab waits for the session wipe.
-pub fn holds_session_wipe(_view: &TabView, first_page_pending: bool) -> bool {
+/// A pending first page means the tab waits for the session wipe ONLY while
+/// that clear is still running (and never for an ephemeral tab, which does
+/// not take part in it): a tab held just for its bundled rule lists is safe
+/// to destroy, and deferring its close would leave it in the tab list until
+/// an event that has already fired.
+pub fn holds_session_wipe(view: &TabView, first_page_pending: bool) -> bool {
     first_page_pending
+        && !view.state.borrow().policy.ephemeral
+        && !super::session_wipe_finished(crate::kept_profile::ProfileKind::Main)
 }
 
 /// No standing to hand over: the local-network boundary is not enforced in
@@ -654,6 +1015,49 @@ pub fn new_tab_allowed(_gate: Option<&NewTabGate>, _url: &str) -> bool {
     true
 }
 
+/// Windows only (new_window.rs): WKWebView never holds a page's new-tab
+/// request, so no ticket exists here and every function taking one is
+/// unreachable. Same shape as unix's.
+pub enum AdoptionTicket {}
+
+/// No-op: nothing here needs the opener's environment at build.
+pub fn on_opener_environment<'a>(
+    builder: WebViewBuilder<'a>,
+    _opener: &WebView,
+) -> WebViewBuilder<'a> {
+    builder
+}
+
+/// Always: a page's new tab is never held, so there is nothing to be not
+/// ready for.
+pub fn adoption_ready(_view: &TabView) -> bool {
+    true
+}
+
+/// Always: every registration this backend makes is answered at build
+/// (`apply_policy` records the engine's own answers; WKUserScript adds are
+/// synchronous).
+pub fn registrations_answered(_view: &TabView) -> bool {
+    true
+}
+
+/// Always: the hand-over guard judges a Windows NavigationStarting veto,
+/// which has no counterpart here.
+pub fn handover_guarded(_view: &TabView) -> bool {
+    true
+}
+
+/// Unreachable: the ticket type has no values.
+pub fn release_adoption(_webview: &WebView, _view: &TabView, ticket: AdoptionTicket) -> bool {
+    match ticket {}
+}
+
+/// Always: every filter on this backend is in place at build; nothing is
+/// attached after a hand-over.
+pub fn attach_deferred_interception(_webview: &WebView, _view: &TabView) -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Session wipe
 //
@@ -667,19 +1071,14 @@ pub fn begin_new_session_wipe(proxy: &EventLoopProxy<UserEvent>) -> bool {
         super::SessionWipeEntry::Waiting => return true,
         super::SessionWipeEntry::Start => {}
     }
-    let types = NSSet::from_slice(&[
-        ns_string!("WKWebsiteDataTypeCookies"),
-        ns_string!("WKWebsiteDataTypeDiskCache"),
-        ns_string!("WKWebsiteDataTypeMemoryCache"),
-        ns_string!("WKWebsiteDataTypeOfflineWebApplicationCache"),
-        ns_string!("WKWebsiteDataTypeLocalStorage"),
-        ns_string!("WKWebsiteDataTypeSessionStorage"),
-        ns_string!("WKWebsiteDataTypeWebSQLDatabases"),
-        ns_string!("WKWebsiteDataTypeIndexedDBDatabases"),
-        ns_string!("WKWebsiteDataTypeServiceWorkerRegistrations"),
-        ns_string!("WKWebsiteDataTypeFetchCache"),
-        ns_string!("WKWebsiteDataTypeHashSalt"),
-    ]);
+    // Every public type WebKit knows, asked of the store itself rather than
+    // hand-kept: a type WebKit adds later is then wiped by default instead
+    // of surviving until someone notices. The engine's strict-transport
+    // cache is deliberately not among the public types, so the mask keeps
+    // the unix mask's promise on its own.
+    let types = unsafe {
+        objc2_web_kit::WKWebsiteDataStore::allWebsiteDataTypes(main_thread_marker())
+    };
     // SAFETY: main-thread singleton store; the block is retained by WebKit.
     let store = unsafe {
         objc2_web_kit::WKWebsiteDataStore::defaultDataStore(main_thread_marker())
@@ -849,13 +1248,15 @@ fn set_ad_blocking(webview: &WebView, view: &TabView, enable: bool) {
     install_content_scripts(webview, view);
     let Some(cc) = content_controller(webview) else { return };
     if enable {
-        install_bundled_filters(&cc);
+        install_bundled_filters(&cc, view);
     } else {
         remove_all_filters(&cc);
-        // Removing every filter also drops any freeze filter, so a frozen tab
-        // whose ad blocking is switched off must re-install it.
+        // Removing every filter also drops any freeze filter, so a frozen
+        // tab whose ad blocking is switched off must get it back. The
+        // installed list is in the run's memory cache, so the re-add is
+        // synchronous: no new compile, no Book round-trip.
         if view.state.borrow().freeze.phase() == FreezePhase::Frozen {
-            install_freeze_filter(webview, view);
+            reinstall_installed_freeze_filter(&cc, view);
         }
     }
 }
@@ -938,12 +1339,20 @@ pub fn unfreeze(webview: &WebView, view: &TabView) {
         let mut st = view.state.borrow_mut();
         st.freeze.unfreeze(Instant::now());
         st.freeze_json = None;
+        // The freeze ends in the Book too: an in-flight compile of a freeze
+        // this tab no longer wants is discarded by its completion, and that
+        // completion still removes the stored copy of a list naming hosts.
+        // The in-memory copies go with it; a later re-freeze re-remembers
+        // them when they land.
+        for id in st.freeze_filters.lift() {
+            forget_rule_list(&id);
+        }
         st.policy.block_ads
     };
     let Some(cc) = content_controller(webview) else { return };
     remove_all_filters(&cc);
     if block_ads {
-        install_bundled_filters(&cc);
+        install_bundled_filters(&cc, view);
     }
 }
 
@@ -966,11 +1375,10 @@ pub fn set_adlist_override(view: &TabView, host: Option<String>) {
 // that backstop exists.
 //
 // `allow_ads_on_tab` rebuilds synchronously BEFORE returning, so the reload
-// `set_tab_ads_allowed` issues next can never go out with the bundled lists
-// still installed -- the contract unix's `sync_ad_filters` gives the
-// response-policy guard, met here by doing the work inline (WKContentRuleList
-// compilation is cached in-process, and both bundled lists are already
-// compiled by the tab's own build).
+// `set_tab_ads_allowed` issues next can never go out without its lists. The
+// rebuild is truly synchronous now that the run keeps its compiled lists in
+// memory: removal and re-add are both plain controller calls, with no store
+// round-trip in between (review finding: only the removal used to be).
 
 thread_local! {
     /// The proxy the overlap filter's settled event goes out through. Set at
@@ -1067,10 +1475,11 @@ pub fn on_ad_overlap_computed(hosts: Vec<String>, proxy: &EventLoopProxy<UserEve
     had_one
 }
 
-/// The overlap compile, WKWebView edition. `compile_and_add` already carries
-/// the whole degrade path (store unavailable, async failure diagnostics);
-/// the generation guard rides in through the captured token so a stale
-/// completion cannot mark the filter Ready.
+/// The overlap compile, WKWebView edition. The degrade path (store
+/// unavailable, async failure diagnostics) matches the bundled compiles; the
+/// generation guard rides in through the captured token so a stale
+/// completion cannot mark the filter Ready, and the accepted list is kept
+/// for the run so an allowed tab's rebuilds are synchronous.
 fn compile_overlap_filter(json: &str, id: &str, token: u64, proxy: &EventLoopProxy<UserEvent>) {
     let Some(store) = rule_list_store() else {
         let current = OVERLAP_GENERATION.with(|g| g.borrow().may_apply(token));
@@ -1101,6 +1510,10 @@ fn compile_overlap_filter(json: &str, id: &str, token: u64, proxy: &EventLoopPro
                         return;
                     }
                     if !list.is_null() {
+                        // Kept for the run: a rebuild re-adds this same
+                        // object synchronously.
+                        let list = Retained::retain(list).expect("rule list pointer");
+                        remember_rule_list(&id_string, &list);
                         OVERLAP.with(|o| *o.borrow_mut() = OverlapFilter::Ready(Some(id_string.clone())));
                     } else {
                         let why = (!error.is_null())
@@ -1177,9 +1590,9 @@ pub fn end_ads_allowance_if_leaving(webview: &WebView, view: &TabView, url: &str
 /// ends the allowance before the new document's requests can go out. The tab
 /// id travels in the wake because `TabView` is opaque here.
 pub fn end_ads_allowance_before_navigation(webview: &WebView, view: &TabView, url: &str) {
-    if end_ads_allowance_if_leaving(webview, view, url) {
-        wake_overlap(UserEvent::AdsAllowanceEnded { tab_id: tab_id_of(view) });
-    }
+    // `end_ads_allowance_if_leaving` posts `AdsAllowanceEnded` itself when it
+    // ends the allowance; posting here too sent the event twice.
+    end_ads_allowance_if_leaving(webview, view, url);
 }
 
 pub fn ads_allowed_site(view: &TabView) -> Option<String> {
@@ -1212,12 +1625,14 @@ fn rebuild_tab_rule_lists(webview: &WebView, view: &TabView) {
         )
     };
     // Rebuild is the whole set: remove everything, then add exactly what the
-    // state wants. No moment with neither matters here -- WKWebView applies
-    // lists to NEW loads, and the caller always follows with a reload (the
-    // switch's contract), so there is no in-flight page to half-protect.
+    // state wants. Every list comes from the run's memory cache, so the
+    // whole rebuild is synchronous: there is no gap between the removal and
+    // the adds in which the tab blocks nothing, and the reload the switch
+    // issues cannot outrun its lists. WKWebView applies lists to NEW loads,
+    // and the caller follows with a reload.
     remove_all_filters(&cc);
     if wants {
-        install_bundled_filters(&cc);
+        install_bundled_filters(&cc, view);
     } else if wants_overlap {
         let ready = OVERLAP.with(|o| match &*o.borrow() {
             OverlapFilter::Ready(Some(id)) => Some(id.clone()),
@@ -1228,15 +1643,21 @@ fn rebuild_tab_rule_lists(webview: &WebView, view: &TabView) {
         }
     }
     if frozen {
-        install_freeze_filter(webview, view);
+        reinstall_installed_freeze_filter(&cc, view);
     }
     install_content_scripts(webview, view);
 }
 
 /// Adds an ALREADY-COMPILED rule list back to this tab's controller. The
-/// store caches by identifier in-process, so the id is enough; compiling
-/// again would be correct but slower.
+/// run's memory cache answers synchronously when this run compiled the list;
+/// the store lookup stays as the fallback (an id reached without its compile
+/// in this run), which is correct but slower, and async.
 fn add_rule_list(cc: &Retained<objc2_web_kit::WKUserContentController>, id: &str) {
+    if let Some(list) = cached_rule_list(id) {
+        // SAFETY: main-thread controller mutation of a list we hold.
+        unsafe { cc.addContentRuleList(&list) };
+        return;
+    }
     let Some(store) = rule_list_store() else { return };
     // The block outlives this frame, so it captures the controller by value.
     let cc = cc.clone();
@@ -2094,12 +2515,18 @@ pub fn yield_auto_freeze(webview: &WebView, view: &TabView) {
     let block_ads = {
         let mut st = view.state.borrow_mut();
         st.freeze.unfreeze(Instant::now());
+        // Same as `unfreeze`: the freeze ends in the Book too, so an
+        // in-flight compile of this tab's freeze is discarded by its
+        // completion.
+        for id in st.freeze_filters.lift() {
+            forget_rule_list(&id);
+        }
         st.policy.block_ads
     };
     let Some(cc) = content_controller(webview) else { return };
     remove_all_filters(&cc);
     if block_ads {
-        install_bundled_filters(&cc);
+        install_bundled_filters(&cc, view);
     }
 }
 
@@ -2185,11 +2612,11 @@ mod macos_backend_tests {
     use super::{diag, recent_diagnostics, DIAG_LOG_CAP};
     use super::{
         ads_allowed_site, ads_base_blocking, current_document, custom_window_frame,
-        engine_settings, freeze_enforced, interception_state, kept_boundary_ready,
-        kept_profile_supported, manually_frozen, network_blocking_supported, page_bytes_supported,
-        replacement_pending, session_lock_registered, split_supported,
-        take_bypass_reload_failed, translate_channel_supported, youtube_ads_install, TabView,
-        MACOS_INTERCEPTION_NAME,
+        engine_settings, freeze_dir_pid, freeze_enforced, initial_navigation_ready,
+        interception_state, kept_boundary_ready, kept_profile_supported, manually_frozen,
+        network_blocking_supported, page_bytes_supported, process_is_gone, replacement_pending,
+        session_lock_registered, split_supported, take_bypass_reload_failed,
+        translate_channel_supported, youtube_ads_install, TabView, MACOS_INTERCEPTION_NAME,
     };
     use crate::platform::privacy::{ScriptInstall, SettingState, TabPolicy, TabState};
     use std::cell::RefCell;
@@ -2326,5 +2753,49 @@ mod macos_backend_tests {
             diag(&format!("macos bound probe {i}"));
         }
         assert!(recent_diagnostics().len() <= DIAG_LOG_CAP);
+    }
+
+    /// The gate the first page waits behind: a tab whose bundled rule lists
+    /// are still compiling holds its first page, and an ephemeral tab whose
+    /// lists have landed may go. The engine-backed half (that the lists do
+    /// land, and that `BundledFiltersSettled` fires) is the smoke gate's job;
+    /// this pins the store-only answers.
+    #[test]
+    fn a_first_page_waits_while_its_rule_lists_compile() {
+        let view = store_only_tab(&TabPolicy::default());
+        view.state.borrow_mut().bundled_filters_loading = 2;
+        assert!(
+            !initial_navigation_ready(&view),
+            "a first page issued while its rule lists compile would go out unfiltered"
+        );
+        view.state.borrow_mut().bundled_filters_loading = 0;
+        view.state.borrow_mut().policy.ephemeral = true;
+        assert!(initial_navigation_ready(&view));
+    }
+
+    /// Only a directory named for a pid may be considered for the sweep, and
+    /// only a real one; the name parser is the first guard.
+    #[test]
+    fn freeze_store_directory_names_parse_to_their_pid() {
+        assert_eq!(freeze_dir_pid("patanyx-42-freeze"), Some(42));
+        assert_eq!(freeze_dir_pid("patanyx-0-freeze"), Some(0));
+        assert_eq!(freeze_dir_pid("patanyx-4294967295-freeze"), Some(4294967295));
+        assert_eq!(
+            freeze_dir_pid("patanyx-42-freeze-old"),
+            None,
+            "a name that is not exactly the pattern is not a store"
+        );
+        assert_eq!(freeze_dir_pid("patanyx--freeze"), None);
+        assert_eq!(freeze_dir_pid("patanyx-4294967296-freeze"), None);
+        assert_eq!(freeze_dir_pid("other-42-freeze"), None);
+        assert_eq!(freeze_dir_pid("patanyx-42"), None);
+    }
+
+    /// The sweep's liveness answer: the running process is not gone. (That a
+    /// reaped pid answers gone is the kernel's word, exercised on the gate
+    /// run itself.)
+    #[test]
+    fn the_running_process_is_not_reported_gone() {
+        assert!(!process_is_gone(std::process::id()));
     }
 }

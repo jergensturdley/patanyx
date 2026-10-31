@@ -1,7 +1,8 @@
 # macOS port: what works, what is off, and why
 
 State of the WKWebView backend (`crates/app/src/platform/macos.rs`), current as
-of the 1.0.7 platform surface. The rule the backend follows: a feature this
+of the 2026-10-29 interim snapshot of the release line (1.0.8). The rule the
+backend follows: a feature this
 port cannot deliver is reported OFF, never half-built and never faked. The
 panel renders these answers, so each `false` below is a promise the UI makes
 to the person using it.
@@ -17,9 +18,9 @@ must be rewritten in the same change.
 - Ad and tracker blocking: compiled `WKContentRuleList`s inside the engine (the WebKitGTK model). A blocked request never leaves the machine. Cosmetic hiding rides a style-injecting user script.
 - Per-tab "allow ads on this tab" (1.0.7): allowance lives in `TabState`, the tab's rule lists rebuild from what the state wants, and the malicious-overlap filter covers an allowed tab. Browser-wide switches can never re-block an allowed tab (`apply_policy` rebases through `TabState::apply_base_policy`).
 - YouTube ad script, GPC, fingerprint divergence, scrollbar styling: user-script set, rebuilt as a whole on every change.
-- Freeze (auto and manual) with a compiled freeze filter; enforcement reported only after WebKit confirms the compile.
+- Freeze (auto and manual) with a compiled freeze filter; enforcement reported only after WebKit confirms the compile. A replacement freeze filter lands before the superseded one leaves (no unfrozen moment on a frozen tab), a compile that finishes after the tab thawed installs nothing, and a freeze that names allowed hosts compiles into a per-run private store whose stored copy is removed as soon as the filter is handled.
 - Strict Tabs, private (ephemeral) tabs on an ephemeral `WKWebsiteDataStore`, ITP (WebKit ships it on; no toggle exists).
-- Session wipe at first tab: the default store's cookies, caches, local/session storage, WebSQL, IndexedDB, service workers, fetch cache and hash salt are cleared once per process, held behind WebKit's async completion. HSTS is deliberately NOT cleared, matching unix.
+- Session wipe at first tab: every public website-data type, asked of `WKWebsiteDataStore` itself (`allWebsiteDataTypes()`), cleared once per process, held behind WebKit's async completion. A type WebKit adds later is wiped by default. Strict-transport data is deliberately NOT cleared, matching unix.
 - Downloads, file open/save panels, clipboard, page capture (visible area), find-in-page UI state, devtools, tunnel proxying, the fingerprint-probe IPC channel (the only channel any content view gets).
 
 ## Reported off, honestly
@@ -46,9 +47,12 @@ must be rewritten in the same change.
   (WebView2's NavigationStarting veto) is structurally absent. Where a
   decision must precede a navigation (ending an allowance), this backend does
   the work before handing WebKit the request.
-- The startup session wipe compiles its filters asynchronously and the
-  first tab's navigation is held until the clear completes, but WebKit's
-  compile callback is not synchronous with the webview build. The wipe mask,
-  the distant-past reach and the held navigation are pinned by
-  `macos_mask_matches_the_site_data_promise` in platform/mod.rs and exercised
-  end to end by `--smoke-test` on hardware.
+- A tab's first navigation is held until the start-up clear completes AND
+  the tab's bundled ad and tracker lists have compiled (the lists are
+  async); the release path is the shared `BundledFiltersSettled` event. The
+  wipe mask, the distant-past reach, the held navigation and the per-run
+  freeze store are pinned by
+  `macos_mask_matches_the_site_data_promise` and
+  `macos_freeze_filters_stay_out_of_the_persistent_store` in
+  platform/mod.rs and `macos_first_page_waits_for_the_ad_and_tracker_filters`
+  in privacy.rs, and exercised end to end by `--smoke-test` on hardware.

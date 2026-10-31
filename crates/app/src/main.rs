@@ -2391,6 +2391,16 @@ fn main() {
                                 // output, and the second silently turns the
                                 // whole run into a test of nothing.
                                 println!("BLOCKLIST hosts={}", blocklist::len());
+                                // Review round 2 asked for hardware
+                                // confirmation that an installed list keeps
+                                // blocking once its stored copy has left the
+                                // store. The copies go HERE, after the
+                                // controllers hold the compiled objects and
+                                // before the navigation: if a stored copy
+                                // were load-bearing, this run would report
+                                // the page's requests escaping.
+                                platform::drop_stored_rule_list_copies();
+                                println!("STORED COPIES dropped");
                                 let _ = app.navigate(url);
                                 let proxy = probe_proxy.clone();
                                 std::thread::spawn(move || {
