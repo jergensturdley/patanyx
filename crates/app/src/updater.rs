@@ -497,6 +497,16 @@ enum Phase {
     /// feed not yet carrying a release). Shown as up to date with the two
     /// versions named, never as "Update refused" in red (decided 2026-09-16).
     Ahead { offered: Version },
+    /// The channel answered, and it does not carry this platform at all:
+    /// the manifest URL returned 404. Not a failure in the user's sense --
+    /// nothing is down (Linux installs reach the same host fine), nothing
+    /// was refused, and retrying cannot change the answer, because the 404
+    /// is the same bytes every install of this platform would fetch. Shown
+    /// calmly, with the way out being whoever provides this copy, rather
+    /// than a red "check failed" that names no cause. Same reasoning as
+    /// `Ahead` (decided 2026-09-16 there; observed for real on the macOS
+    /// port 2026-10-30, where stable and beta both answer 404).
+    NoChannel,
     /// Authentic, newer, at/above floor, for this platform. The prompt is
     /// showing; nothing has been downloaded yet.
     Offered { manifest: Manifest },
@@ -1619,6 +1629,9 @@ fn status_json(u: &Updater) -> Value {
             out["state"] = json!("ahead");
             out["offered"] = json!(offered.to_string());
         }
+        // Calm on purpose: the sentence lives in the panel (i18n), like
+        // `ahead` and `uptodate`, not in a Rust detail string.
+        Phase::NoChannel => out["state"] = json!("nochannel"),
         Phase::Offered { manifest } => {
             out["state"] = json!("offered");
             out["offered"] = json!(manifest.version().to_string());
@@ -1774,6 +1787,13 @@ fn run_check_engine(
 ) -> Phase {
     let bytes = match fetch_manifest() {
         Ok(bytes) => bytes,
+        // 404 is not an outage: it is the channel saying, in the only
+        // protocol it has, that this platform has no manifest at all. "Check
+        // failed" would read as the server being down, which it is not --
+        // installs of the served platforms reach the same host fine -- and
+        // it would invite retries that cannot change the answer. Any other
+        // non-2xx stays a retryable failure.
+        Err(FetchError::Http(404)) => return Phase::NoChannel,
         Err(e) => {
             return Phase::Failed {
                 detail: fetch_detail(&e),
@@ -2932,7 +2952,7 @@ mod tests {
                  something that is not true yet"
             );
         }
-        for state in ["offered", "ready", "uptodate", "failed", "refused", "install_broken"] {
+        for state in ["offered", "ready", "uptodate", "failed", "refused", "install_broken", "nochannel"] {
             assert!(
                 !in_flight(&json!({ "state": state })),
                 "{state} is a settled answer and must be reported, or the \
@@ -3988,6 +4008,77 @@ mod tests {
             Ok(envelope.into_bytes())
         });
         assert!(matches!(phase, Phase::UpToDate), "got {phase:?}");
+    }
+
+    /// The macOS channel answers 404 today (stable and beta both). The
+    /// panel must say "no channel for this platform", not "check failed":
+    /// the server is up, other platforms reach it, and retrying cannot
+    /// change the answer.
+    #[test]
+    fn a_manifest_404_is_no_channel_not_a_failure() {
+        let Some(platform) = running_platform() else {
+            return;
+        };
+        let phase = run_check_with(
+            &dev_trusted_keys(),
+            &FLOOR,
+            current_version().unwrap(),
+            platform,
+            || Err(FetchError::Http(404)),
+        );
+        assert!(matches!(phase, Phase::NoChannel), "got {phase:?}");
+    }
+
+    /// Every other non-2xx keeps its honest failure shape: retryable, with
+    /// the status named in the detail.
+    #[test]
+    fn other_http_statuses_stay_retryable_failures() {
+        let Some(platform) = running_platform() else {
+            return;
+        };
+        for code in [403u16, 500, 503] {
+            let phase = run_check_with(
+                &dev_trusted_keys(),
+                &FLOOR,
+                current_version().unwrap(),
+                platform,
+                move || Err(FetchError::Http(code)),
+            );
+            match &phase {
+                Phase::Failed { detail, resume } => {
+                    assert!(resume.is_none(), "{code}: nothing was offered");
+                    assert!(
+                        detail.contains(&format!("HTTP {code}")),
+                        "{code}: detail must name the status, got {detail:?}"
+                    );
+                }
+                other => panic!("{code}: expected Failed, got {other:?}"),
+            }
+        }
+    }
+
+    /// The status renders as its own calm state, and the check cooldown
+    /// applies to it (re-polling a finished check is the disclosure the
+    /// cooldown exists to prevent; only a FAILED check is exempt, so its
+    /// retry is free).
+    #[test]
+    fn no_channel_renders_calm_and_cooldowns_like_a_settled_answer() {
+        let u = Updater {
+            phase: Phase::NoChannel,
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        let snap = status_json(&u);
+        assert_eq!(snap["state"], json!("nochannel"));
+        assert!(
+            snap.get("reason").is_none() && snap.get("retry").is_none(),
+            "no channel is neither a refusal nor a retryable failure"
+        );
+        assert!(
+            in_cooldown(Some(Instant::now()), &Phase::NoChannel),
+            "a 404 answer is settled; the cooldown must apply to it"
+        );
     }
 
     #[test]

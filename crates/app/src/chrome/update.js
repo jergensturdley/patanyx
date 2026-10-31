@@ -597,6 +597,18 @@
       detailText = await i18nResolve("chrome-js-update-ahead-detail",
         { running: st.running || "", offered: st.offered || "" },
         "This machine runs " + (st.running || "") + ", newer than the " + (st.offered || "") + " the update server offers.");
+    } else if (st.state === "nochannel") {
+      // The channel is up and answers 404 for this platform: there is no
+      // manifest to compare against at all. Not a failure (the server is
+      // not down; installs of the served platforms reach it fine) and not
+      // a refusal (nothing was withheld), so calm gray, not red. The way
+      // out is whoever provides this copy.
+      stateText = i18nText("chrome-js-update-nochannel-state",
+        "No update channel for this platform.");
+      detailText = i18nText("chrome-js-update-nochannel-detail",
+        "The update server does not carry PATANYX for this platform. " +
+          "Update this copy from whoever provides it. Nothing has been " +
+          "downloaded or installed.");
     } else if (st.state === "offered") {
       stateText = await i18nResolve("chrome-js-update-offered-state",
         { version: st.offered },
