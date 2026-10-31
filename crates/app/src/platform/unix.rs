@@ -823,6 +823,9 @@ pub fn build_content(
     _permissions: crate::state::PermissionBook,
     // One profile on this backend (kept_profile.rs).
     _profile: crate::kept_profile::ProfileKind,
+    // Windows only: no page request is ever held on this backend
+    // (new_window.rs); a page's new tab loads its address.
+    _adopting: bool,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
     // Build blank and navigate only after the per-tab UserContentManager has
     // both the divergence UserScript and its message handler. Applying the
@@ -4236,6 +4239,35 @@ pub fn holds_session_wipe(view: &TabView, first_page_pending: bool) -> bool {
 /// No standing to hand over: the local-network boundary is not enforced on
 /// WebKitGTK (see `note_app_navigation`).
 pub struct NewTabGate;
+
+/// Windows only (new_window.rs): WebKitGTK never holds a page's request, so
+/// no ticket exists here and every function taking one is unreachable.
+pub enum AdoptionTicket {}
+
+pub fn on_opener_environment<'a>(builder: WebViewBuilder<'a>, _opener: &WebView) -> WebViewBuilder<'a> {
+    builder
+}
+
+pub fn adoption_ready(_view: &TabView) -> bool {
+    true
+}
+
+pub fn registrations_answered(_view: &TabView) -> bool {
+    true
+}
+
+pub fn handover_guarded(_view: &TabView) -> bool {
+    true
+}
+
+pub fn release_adoption(_webview: &WebView, _view: &TabView, ticket: AdoptionTicket) -> bool {
+    match ticket {}
+}
+
+/// Every filter on this backend is in place at build.
+pub fn attach_deferred_interception(_webview: &WebView, _view: &TabView) -> bool {
+    true
+}
 
 pub fn new_tab_gate(_view: &TabView) -> NewTabGate {
     NewTabGate

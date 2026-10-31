@@ -369,10 +369,10 @@ NOTICE, not here.
 | `rustc_version` | 0.4.1 | MIT OR Apache-2.0 |
 | `rustfft` | 6.4.1 | MIT OR Apache-2.0 |
 | `rustix` | 1.1.4 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
-| `rustls` | 0.23.45 | Apache-2.0 OR ISC OR MIT |
+| `rustls` | 0.23.46 | Apache-2.0 OR ISC OR MIT |
 | `rustls-native-certs` | 0.8.4 | Apache-2.0 OR ISC OR MIT |
 | `rustls-pki-types` | 1.15.1 | MIT OR Apache-2.0 |
-| `rustls-webpki` | 0.103.15 | ISC |
+| `rustls-webpki` | 0.103.16 | ISC |
 | `rustversion` | 1.0.23 | MIT OR Apache-2.0 |
 | `same-file` | 1.0.6 | Unlicense/MIT |
 | `scan_fmt` | 0.2.6 | MIT |
@@ -473,7 +473,7 @@ NOTICE, not here.
 | `webkit2gtk` | 2.0.2 | MIT |
 | `webkit2gtk-sys` | 2.0.2 | MIT |
 | `webpki-roots` | 0.26.11 | CDLA-Permissive-2.0 |
-| `webpki-roots` | 1.0.9 | CDLA-Permissive-2.0 |
+| `webpki-roots` | 1.0.10 | CDLA-Permissive-2.0 |
 | `webview2-com` | 0.38.2 | MIT |
 | `webview2-com-macros` | 0.8.1 | MIT |
 | `webview2-com-sys` | 0.38.2 | MIT |

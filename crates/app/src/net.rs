@@ -532,4 +532,190 @@ mod tests {
         assert_eq!(parse_win_proxy_server("ftp=c:3"), None);
         assert_eq!(parse_win_proxy_server("   "), None);
     }
+
+    // ---- The eMudhra / emSign distrust, October 2026 ----------------------
+    //
+    // The private keys of eight eMudhra intermediate CAs "were generated with
+    // insufficient randomness", which lets anyone forge certificates under
+    // them (Chrome Root Program, 2026-10-20), so a certificate chaining
+    // through one proves nothing. Two fixes, in two crates, both pinned here
+    // by behaviour rather than by version number:
+    //
+    // * webpki-roots 1.0.10 (RUSTSEC-2026-0381) drops emSign ECC Root CA - G3
+    //   from the bundled Mozilla roots.
+    // * rustls-webpki 0.103.16 (RUSTSEC-2026-0382) refuses any chain holding
+    //   one of the eight public keys, whatever root it ends at. That is what
+    //   protects `Roots::OperatingSystem`, whose OS half may still carry the
+    //   root on a machine that has not updated.
+    //
+    // No compromised private key is used or needed: a certificate that merely
+    // CARRIES one of the published public keys, issued by a throwaway test CA,
+    // is enough, because the key is refused before any signature is checked.
+
+    /// The subject of emSign ECC Root CA - G3 as webpki-roots 1.0.9 carried it
+    /// (the Name's contents, without the outer SEQUENCE).
+    const EMSIGN_ECC_ROOT_G3_SUBJECT: &[u8] = b"1\x0b0\t\x06\x03U\x04\x06\x13\x02IN1\x130\x11\x06\x03U\x04\x0b\x13\nemSign PKI1%0#\x06\x03U\x04\n\x13\x1ceMudhra Technologies Limited1 0\x1e\x06\x03U\x04\x03\x13\x17emSign ECC Root CA - G3";
+
+    /// One of the eight distrusted public keys (P-384): rustls-webpki 0.103.16,
+    /// src/data/distrusted/EMOVTLSCAG3B.spki.der, which holds the
+    /// SubjectPublicKeyInfo's contents, wrapped here in its outer SEQUENCE
+    /// (30 76) as a certificate carries it.
+    const DISTRUSTED_EMSIGN_SPKI_HEX: &str = "3076301006072a8648ce3d020106052b810400220362000473897aa0eb3cfdca8b12402ffaf0abc4e1212baf8dee778ac9ee2d6db83fac280c5e05638ae7a2acd71c322a8e361cdeb9f69c4302b9dd8d73d1cc6caab2cc0aee4e216ce979dd518a4af4b626e5684cdd658037ed0c854e4cc12f4cf8646d0d";
+
+    fn carries_subject(store: &rustls::RootCertStore, subject: &[u8]) -> bool {
+        store.roots.iter().any(|anchor| anchor.subject.as_ref() == subject)
+    }
+
+    #[test]
+    fn the_bundled_roots_no_longer_carry_emsign_ecc_root_g3() {
+        // Control: the check can see the root when it is there.
+        let mut planted = rustls::RootCertStore::empty();
+        planted.roots.push(rustls::pki_types::TrustAnchor {
+            subject: rustls::pki_types::Der::from_slice(EMSIGN_ECC_ROOT_G3_SUBJECT),
+            subject_public_key_info: rustls::pki_types::Der::from_slice(&[]),
+            name_constraints: None,
+        });
+        assert!(carries_subject(&planted, EMSIGN_ECC_ROOT_G3_SUBJECT));
+
+        assert!(
+            !carries_subject(&root_store(Roots::Bundled), EMSIGN_ECC_ROOT_G3_SUBJECT),
+            "the strict store still trusts emSign ECC Root CA - G3; webpki-roots must be >= 1.0.10"
+        );
+    }
+
+    // A minimal DER writer: just enough X.509 for a test CA, an intermediate
+    // and a leaf. Short-form and long-form lengths, nothing else.
+    fn tlv(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![tag];
+        let len = body.len();
+        if len < 0x80 {
+            out.push(len as u8);
+        } else {
+            let bytes: Vec<u8> = len.to_be_bytes().iter().copied().skip_while(|&b| b == 0).collect();
+            out.push(0x80 | bytes.len() as u8);
+            out.extend(bytes);
+        }
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn seq(parts: &[&[u8]]) -> Vec<u8> {
+        tlv(0x30, &parts.concat())
+    }
+
+    fn cn_name(cn: &str) -> Vec<u8> {
+        let atv = seq(&[&[0x06, 0x03, 0x55, 0x04, 0x03], &tlv(0x0c, cn.as_bytes())]);
+        seq(&[&tlv(0x31, &atv)])
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// A P-256 key the test owns, and its SubjectPublicKeyInfo.
+    fn test_key() -> (ring::signature::EcdsaKeyPair, Vec<u8>) {
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        let alg = seq(&[
+            &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01],
+            &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+        ]);
+        let spki = seq(&[&alg, &tlv(0x03, &[&[0u8][..], key.public_key().as_ref()].concat())]);
+        (key, spki)
+    }
+
+    /// An X.509 v3 certificate for `spki`, signed by `issuer_key`. A CA gets
+    /// basicConstraints cA; a leaf gets a DNS name instead.
+    fn cert(serial: u8, issuer: &str, subject: &str, spki: &[u8], ca: bool, issuer_key: &ring::signature::EcdsaKeyPair) -> Vec<u8> {
+        let ecdsa_sha256 = seq(&[&[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02]]);
+        let validity = seq(&[&tlv(0x17, b"260101000000Z"), &tlv(0x17, b"270101000000Z")]);
+        let extension = if ca {
+            let value = seq(&[&[0x01, 0x01, 0xff]]);
+            seq(&[&[0x06, 0x03, 0x55, 0x1d, 0x13], &[0x01, 0x01, 0xff], &tlv(0x04, &value)])
+        } else {
+            let value = seq(&[&tlv(0x82, b"updates.patanyx.test")]);
+            seq(&[&[0x06, 0x03, 0x55, 0x1d, 0x11], &tlv(0x04, &value)])
+        };
+        let tbs = seq(&[
+            &[0xa0, 0x03, 0x02, 0x01, 0x02],
+            &[0x02, 0x01, serial],
+            &ecdsa_sha256,
+            &cn_name(issuer),
+            &validity,
+            &cn_name(subject),
+            spki,
+            &tlv(0xa3, &seq(&[&extension])),
+        ]);
+        let signature = issuer_key.sign(&ring::rand::SystemRandom::new(), &tbs).unwrap();
+        seq(&[&tbs, &ecdsa_sha256, &tlv(0x03, &[&[0u8][..], signature.as_ref()].concat())])
+    }
+
+    /// The strict store plus one throwaway test root, judged by the same
+    /// rustls verifier `tls_config` builds from it.
+    fn verify(test_root: &[u8], chain: &[Vec<u8>]) -> Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        let mut store = root_store(Roots::Bundled);
+        store.add(CertificateDer::from(test_root.to_vec())).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            std::sync::Arc::new(store),
+            std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .unwrap();
+        let intermediates: Vec<CertificateDer<'_>> = chain[1..].iter().map(|c| CertificateDer::from(c.clone())).collect();
+        verifier
+            .verify_server_cert(
+                &CertificateDer::from(chain[0].clone()),
+                &intermediates,
+                &ServerName::try_from("updates.patanyx.test").unwrap(),
+                &[],
+                UnixTime::since_unix_epoch(Duration::from_secs(1_792_713_600)), // 2026-10-23
+            )
+            .map(|_| ())
+    }
+
+    fn is_distrusted(result: &Result<(), rustls::Error>) -> bool {
+        matches!(
+            result,
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Other(e)))
+                if format!("{e:?}").contains("CertDistrusted")
+        )
+    }
+
+    #[test]
+    fn a_chain_through_a_distrusted_emsign_key_is_refused() {
+        let (root_key, root_spki) = test_key();
+        let root = cert(1, "PATANYX Test Root", "PATANYX Test Root", &root_spki, true, &root_key);
+
+        // Controls: the same shapes with keys nobody distrusts verify, so a
+        // refusal below is the distrust and not a malformed test chain.
+        let (_, leaf_spki) = test_key();
+        let leaf = cert(2, "PATANYX Test Root", "leaf", &leaf_spki, false, &root_key);
+        assert_eq!(verify(&root, &[leaf]), Ok(()), "control: a plain test leaf must verify");
+
+        let (mid_key, mid_spki) = test_key();
+        let mid = cert(3, "PATANYX Test Root", "PATANYX Test CA", &mid_spki, true, &root_key);
+        let (_, leaf_spki) = test_key();
+        let leaf = cert(4, "PATANYX Test CA", "leaf", &leaf_spki, false, &mid_key);
+        assert_eq!(verify(&root, &[leaf, mid]), Ok(()), "control: a test intermediate must verify");
+
+        let distrusted = hex(DISTRUSTED_EMSIGN_SPKI_HEX);
+
+        // A leaf carrying the key, correctly signed by a trusted root: every
+        // other check passes, so only the distrust can refuse it.
+        let leaf = cert(5, "PATANYX Test Root", "leaf", &distrusted, false, &root_key);
+        let result = verify(&root, &[leaf]);
+        assert!(is_distrusted(&result), "a certificate holding a distrusted emSign key was not refused as distrusted: {result:?}");
+
+        // The real attack shape: the key as an INTERMEDIATE between a trusted
+        // root and a leaf. Nobody here can sign as it, and nobody needs to.
+        let mid = cert(6, "PATANYX Test Root", "emSign test intermediate", &distrusted, true, &root_key);
+        let (other_key, leaf_spki) = test_key();
+        let leaf = cert(7, "emSign test intermediate", "leaf", &leaf_spki, false, &other_key);
+        let result = verify(&root, &[leaf, mid]);
+        assert!(is_distrusted(&result), "a chain through a distrusted emSign intermediate was not refused as distrusted: {result:?}");
+    }
 }

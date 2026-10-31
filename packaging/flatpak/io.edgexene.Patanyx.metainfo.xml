@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.8" date="2026-10-28">
+      <description>
+        <p>This version fixes security problems in the connections PATANYX makes for itself, such as update checks and Premium activation. They no longer accept certificates issued through the eight eMudhra intermediate certificate authorities whose private keys became known in October 2026, and emSign ECC Root CA - G3 is gone from PATANYX's built-in list of trusted roots. The TLS library they use includes four security fixes. This update does not change how the pages you visit are checked: the web engine does that. On Windows with WebView2 155.0.4283.62 or newer, Continue on Google Flights now opens the airline's page. Update as soon as you can.</p>
+      </description>
+    </release>
     <release version="1.0.7" date="2026-10-12">
       <description>
         <p>You can now allow ads and trackers on one tab, for the site it is on; the tab goes back to blocking when it moves to another site or closes. PATANYX now tells you when a site you open is already open in another tab, and fixes several smaller issues. The toolbar is easier to arrange: Reader View, Updates and About moved into a new Menu, and each group of buttons can fold into one. There are three more chrome color schemes, five more accents, textures and ready-made presets, and panels, menus and notices now fade and slide, with a Reduce motion switch. On Windows, PATANYX now starts on PCs that do not have Microsoft's Visual C++ runtime installed.</p>

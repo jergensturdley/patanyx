@@ -448,6 +448,7 @@ pub fn run(event_loop: EventLoop<UserEvent>, hosts: &platform::Hosts) -> ! {
         1,
         Default::default(),
         crate::kept_profile::ProfileKind::Main,
+        false,
     );
     // The builder gained a third value on the 0.9.66 line (the startup-wipe
     // gate); the probe does not drive that path and only needs the pair.
