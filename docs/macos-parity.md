@@ -22,6 +22,7 @@ must be rewritten in the same change.
 - Strict Tabs, private (ephemeral) tabs on an ephemeral `WKWebsiteDataStore`, ITP (WebKit ships it on; no toggle exists).
 - Session wipe at first tab: every public website-data type, asked of `WKWebsiteDataStore` itself (`allWebsiteDataTypes()`), cleared once per process, held behind WebKit's async completion. A type WebKit adds later is wiped by default. Strict-transport data is deliberately NOT cleared, matching unix.
 - Downloads, file open/save panels, clipboard, page capture (visible area), find-in-page UI state, devtools, tunnel proxying, the fingerprint-probe IPC channel (the only channel any content view gets).
+- About page: names the engine as WKWebView and compiles an attribution file generated for this configuration, so the objc2 and block2 notices travel with the binary (`scripts/shipping-licenses.py` carries the darwin configs). The accent disclosure sentence compiles in here too, because the scrollbar colour reaches pages through the injected style (`set_page_scrollbar`), exactly as on Windows.
 
 ## Reported off, honestly
 
